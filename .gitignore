@@ -13,3 +13,6 @@ venv/
 *.pt
 weights/
 logs/
+person_region_extraction/output/
+web_output/
+output/
