@@ -134,14 +134,11 @@ def _prepare_quantized_input(
     dtype: np.dtype,
     quantization: Tuple[float, int],
 ) -> np.ndarray:
-    scale, zero_point = quantization
-    if scale <= 0:
-        return image.astype(dtype)
-
-    quantized = np.round(image.astype(np.float32) / scale + zero_point)
-    dtype_info = np.iinfo(dtype)
-    quantized = np.clip(quantized, dtype_info.min, dtype_info.max)
-    return quantized.astype(dtype)
+    if np.issubdtype(dtype, np.integer):
+        dtype_info = np.iinfo(dtype)
+        clipped = np.clip(image, dtype_info.min, dtype_info.max)
+        return clipped.astype(dtype)
+    return image.astype(dtype)
 
 
 def _prepare_input_tensor(

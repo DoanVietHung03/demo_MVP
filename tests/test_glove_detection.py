@@ -5,12 +5,35 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import numpy as np
+
 from glove_detection.config import GloveDetectionConfig
-from glove_detection.inference import load_labels, normalize_glove_label
+from glove_detection.inference import (
+    _prepare_quantized_input,
+    load_labels,
+    normalize_glove_label,
+)
 from glove_detection.pipeline import resolve_final_label, resolve_input_hands_dir
 
 
 class GloveDetectionInferenceTests(unittest.TestCase):
+    def test_prepare_quantized_input_preserves_uint8_pixel_values(self) -> None:
+        image = np.asarray(
+            [
+                [[0, 12, 255], [64, 128, 192]],
+            ],
+            dtype=np.uint8,
+        )
+
+        prepared = _prepare_quantized_input(
+            image,
+            dtype=np.dtype(np.uint8),
+            quantization=(0.0078431377, 127),
+        )
+
+        self.assertEqual(prepared.dtype, np.uint8)
+        np.testing.assert_array_equal(prepared, image)
+
     def test_load_labels_supports_indexed_format(self) -> None:
         with TemporaryDirectory() as temp_dir:
             labels_path = Path(temp_dir) / "labels.txt"

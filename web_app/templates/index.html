@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Main Pipeline Dashboard</title>
+    <style>
+        :root {
+            --bg: #000000;
+            --panel: #0b0b0b;
+            --panel-2: #111111;
+            --accent: #00ff88;
+            --accent-2: #00c46a;
+            --text: #eeeeee;
+            --muted: #8a8a8a;
+            --danger-bg: #2b0f12;
+            --danger-border: #7f1d1d;
+        }
+        * { box-sizing: border-box; }
+        body {
+            font-family: "Segoe UI", Arial, sans-serif;
+            background:
+                radial-gradient(circle at top right, rgba(0, 255, 136, 0.12), transparent 25%),
+                linear-gradient(180deg, #020202 0%, #000000 100%);
+            color: var(--text);
+            margin: 0;
+            min-height: 100vh;
+        }
+        .shell {
+            width: min(1380px, calc(100vw - 32px));
+            margin: 0 auto;
+            padding: 20px 0 40px;
+        }
+        .topbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 16px;
+            flex-wrap: wrap;
+            margin-bottom: 18px;
+        }
+        h1 {
+            margin: 0;
+            color: var(--accent);
+            text-shadow: 0 0 15px rgba(0, 255, 136, 0.35);
+            font-size: clamp(2rem, 4vw, 3rem);
+            font-weight: 800;
+        }
+        .sub {
+            color: var(--muted);
+            margin-top: 6px;
+        }
+        .btn {
+            display: inline-block;
+            padding: 10px 18px;
+            background-color: #0d0d0d;
+            color: var(--accent);
+            text-decoration: none;
+            font-size: 15px;
+            font-weight: 700;
+            border: 2px solid var(--accent);
+            border-radius: 10px;
+            box-shadow: 0 0 12px rgba(0, 255, 136, 0.14);
+            transition: all 0.2s ease;
+        }
+        .btn:hover {
+            background-color: var(--accent);
+            color: #000000;
+        }
+        .layout {
+            display: grid;
+            grid-template-columns: minmax(320px, 390px) minmax(0, 1fr);
+            gap: 20px;
+        }
+        .panel {
+            background: linear-gradient(180deg, rgba(13, 13, 13, 0.95), rgba(6, 6, 6, 0.96));
+            border: 1px solid rgba(0, 255, 136, 0.18);
+            border-radius: 18px;
+            box-shadow: 0 0 28px rgba(0, 255, 136, 0.08);
+        }
+        .form-panel {
+            padding: 18px;
+        }
+        .video-panel {
+            padding: 12px;
+        }
+        .video-frame {
+            border: 2px solid rgba(0, 255, 136, 0.55);
+            border-radius: 14px;
+            overflow: hidden;
+            background: #000;
+            min-height: 360px;
+        }
+        .video-frame img {
+            width: 100%;
+            display: block;
+        }
+        .placeholder {
+            min-height: 360px;
+            display: grid;
+            place-items: center;
+            color: var(--muted);
+            text-align: center;
+            padding: 32px;
+        }
+        .status-bar {
+            margin-top: 14px;
+            color: var(--muted);
+            font-size: 14px;
+        }
+        form {
+            display: grid;
+            gap: 14px;
+        }
+        .grid {
+            display: grid;
+            gap: 12px;
+        }
+        .grid.two {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+        label {
+            display: grid;
+            gap: 7px;
+            font-size: 14px;
+            font-weight: 600;
+            color: #d8d8d8;
+        }
+        input {
+            width: 100%;
+            border-radius: 10px;
+            border: 1px solid #2a2a2a;
+            background: var(--panel-2);
+            color: #ffffff;
+            padding: 12px 12px;
+            font: inherit;
+        }
+        input[type=file] {
+            padding: 10px;
+        }
+        button {
+            width: 100%;
+            border: none;
+            border-radius: 12px;
+            padding: 14px 16px;
+            background: linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%);
+            color: #000000;
+            font: inherit;
+            font-weight: 800;
+            cursor: pointer;
+        }
+        .hint {
+            color: var(--muted);
+            font-size: 13px;
+            line-height: 1.45;
+        }
+        .error {
+            margin-bottom: 16px;
+            padding: 12px 14px;
+            background: var(--danger-bg);
+            border: 1px solid var(--danger-border);
+            border-radius: 12px;
+            color: #fecaca;
+        }
+        .meta {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 12px;
+            margin-top: 16px;
+        }
+        .meta-card {
+            padding: 12px;
+            border-radius: 12px;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+        }
+        .meta-card strong {
+            display: block;
+            color: var(--accent);
+            font-size: 1.2rem;
+            margin-bottom: 4px;
+        }
+        .toggle {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 12px;
+            border-radius: 10px;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+        }
+        .toggle input {
+            width: auto;
+            margin: 0;
+        }
+        .toggle-stack {
+            display: grid;
+            gap: 10px;
+        }
+        .inline-note {
+            color: var(--muted);
+            font-size: 12px;
+            line-height: 1.4;
+        }
+        .path-text {
+            margin-top: 14px;
+            color: var(--muted);
+            font-size: 13px;
+            line-height: 1.5;
+            word-break: break-word;
+        }
+        .stage-list {
+            display: grid;
+            gap: 10px;
+            margin-top: 16px;
+        }
+        .stage-item {
+            display: grid;
+            gap: 4px;
+            padding: 12px;
+            border-radius: 12px;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+        }
+        .stage-item strong {
+            color: #ffffff;
+        }
+        .stage-item .stage-status {
+            color: var(--accent);
+            font-weight: 700;
+            text-transform: uppercase;
+            font-size: 12px;
+            letter-spacing: 0.05em;
+        }
+        .stage-item.disabled .stage-status {
+            color: var(--muted);
+        }
+        .stage-item.failed .stage-status {
+            color: #fca5a5;
+        }
+        @media (max-width: 1000px) {
+            .layout { grid-template-columns: 1fr; }
+            .meta { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="shell">
+        <div class="topbar">
+            <div>
+                <h1>MAIN PIPELINE DASHBOARD</h1>
+                <div class="sub">One-click web runner cho person detection, region extraction, facemask, glove và behavior tùy chọn</div>
+            </div>
+            <a href="{{ url_for('history') }}" class="btn">Xem Lịch Sử Xử Lý</a>
+        </div>
+
+        {% if error %}
+            <div class="error">{{ error }}</div>
+        {% endif %}
+
+        <div class="layout">
+            <section class="panel form-panel">
+                <form method="post" action="{{ url_for('start_job') }}" enctype="multipart/form-data">
+                    <div class="grid">
+                        <label>
+                            Video path trên server
+                            <input type="text" name="source_path" value="{{ defaults.source }}">
+                        </label>
+                        <label>
+                            Hoặc upload MP4
+                            <input type="file" name="source_file" accept=".mp4,video/mp4">
+                        </label>
+                    </div>
+                    <div class="hint">Web hiện gọi trực tiếp `main_pipeline`. Preview MJPEG chỉ hiển thị trong lúc stage `person_detection` đang chạy; các stage phía sau tiếp tục xử lý nền trong cùng job.</div>
+                    <div class="grid two">
+                        <label>
+                            Model
+                            <input type="text" name="model_path" value="{{ defaults.model_path }}">
+                        </label>
+                        <label>
+                            Device
+                            <input type="text" name="device" value="{{ defaults.device }}">
+                        </label>
+                        <label>
+                            Confidence
+                            <input type="number" name="confidence_threshold" min="0.05" max="0.95" step="0.05" value="{{ defaults.confidence_threshold }}">
+                        </label>
+                        <label>
+                            IOU
+                            <input type="number" name="iou_threshold" min="0.05" max="0.95" step="0.05" value="{{ defaults.iou_threshold }}">
+                        </label>
+                        <label>
+                            Crop padding
+                            <input type="number" name="crop_padding" min="0" step="1" value="{{ defaults.crop_padding }}">
+                        </label>
+                        <label>
+                            Resize scale
+                            <input type="number" name="input_resize_scale" min="0.1" max="1.0" step="0.05" value="{{ defaults.input_resize_scale }}">
+                        </label>
+                        <label>
+                            Frame skip
+                            <input type="number" name="frame_skip" min="0" step="1" value="{{ defaults.frame_skip }}">
+                        </label>
+                        <label>
+                            Track TTL
+                            <input type="number" name="track_ttl_frames" min="1" step="1" value="{{ defaults.track_ttl_frames }}">
+                        </label>
+                        <label>
+                            Alert cooldown
+                            <input type="number" name="alert_cooldown_frames" min="1" step="1" value="{{ defaults.alert_cooldown_frames or '' }}">
+                        </label>
+                        <label>
+                            Max frames
+                            <input type="number" name="max_frames" min="1" step="1" value="{{ defaults.max_frames or '' }}">
+                        </label>
+                    </div>
+                    <div class="hint">Simple mode: bạn chỉ cần bật stage muốn lấy kết quả. Nếu chọn `facemask` hoặc `glove`, app sẽ tự bật `person_region_extraction` và `person_detection` để job luôn hợp lệ.</div>
+                    <div class="toggle-stack">
+                        <label class="toggle">
+                            <input id="run_person_detection" type="checkbox" name="run_person_detection" value="1" {% if defaults.run_person_detection %}checked{% endif %}>
+                            <span>
+                                Chạy `person_detection`
+                                <span class="inline-note">Stage gốc để tạo crop người và preview MJPEG trên web.</span>
+                            </span>
+                        </label>
+                        <label class="toggle">
+                            <input id="run_region_extraction" type="checkbox" name="run_region_extraction" value="1" {% if defaults.run_region_extraction %}checked{% endif %}>
+                            <span>
+                                Chạy `person_region_extraction`
+                                <span class="inline-note">Tách `head_face`, `hands`, `torso` từ crop người.</span>
+                            </span>
+                        </label>
+                        <label class="toggle">
+                            <input id="run_facemask_detection" type="checkbox" name="run_facemask_detection" value="1" {% if defaults.run_facemask_detection %}checked{% endif %}>
+                            <span>
+                                Chạy `facemask_detection`
+                                <span class="inline-note">Nếu bật, UI sẽ tự bật `region extraction` và `person detection`.</span>
+                            </span>
+                        </label>
+                        <label class="toggle">
+                            <input id="run_glove_detection" type="checkbox" name="run_glove_detection" value="1" {% if defaults.run_glove_detection %}checked{% endif %}>
+                            <span>
+                                Chạy `glove_detection`
+                                <span class="inline-note">Nếu bật, UI sẽ tự bật `region extraction` và `person detection`.</span>
+                            </span>
+                        </label>
+                        <label class="toggle">
+                            <input id="run_behavior_detection" type="checkbox" name="run_behavior_detection" value="1" {% if defaults.run_behavior_detection %}checked{% endif %}>
+                            <span>
+                                Chạy `behavior_detection`
+                                <span class="inline-note">Nhánh độc lập trên video nguồn, không phụ thuộc `region extraction`.</span>
+                            </span>
+                        </label>
+                    </div>
+                    <button type="submit">Chạy Pipeline</button>
+                </form>
+            </section>
+
+            <section class="panel video-panel">
+                {% if current_job %}
+                    <div class="video-frame">
+                        <img src="{{ url_for('video_feed', job_id=current_job.job_id) }}" alt="Live Video Feed">
+                    </div>
+                    <div class="status-bar">● Job {{ current_job.job_id }} | Source: {{ current_job.source_name }} | Device: {{ current_job.device }} | Stage: {{ current_job.current_stage or 'waiting' }}</div>
+                    <div class="meta">
+                        <div class="meta-card">
+                            <strong>{{ current_job.status }}</strong>
+                            <span>Trạng thái job</span>
+                        </div>
+                        <div class="meta-card">
+                            <strong>{{ current_job.current_stage or 'pending' }}</strong>
+                            <span>Stage hiện tại</span>
+                        </div>
+                        <div class="meta-card">
+                            <strong>{{ current_job.total_alerts }}</strong>
+                            <span>Alert person stage</span>
+                        </div>
+                        <div class="meta-card">
+                            <strong>{{ current_job.unique_track_count }}</strong>
+                            <span>Tracker ID duy nhất</span>
+                        </div>
+                    </div>
+                    <div class="path-text">
+                        Output root: {{ current_job.pipeline_output_root or 'N/A' }}<br>
+                        Summary path: {{ current_job.summary_path or 'N/A' }}<br>
+                        Crop dir: {{ current_job.crop_dir or 'N/A' }}
+                    </div>
+                    <div class="stage-list">
+                        {% for stage in current_job.stage_views %}
+                            <div class="stage-item {% if not stage.enabled %}disabled{% elif stage.status == 'failed' %}failed{% endif %}">
+                                <strong>{{ stage.label }}</strong>
+                                <span class="stage-status">{{ stage.status }}</span>
+                                {% if stage.output_path %}
+                                    <span>{{ stage.output_path }}</span>
+                                {% elif stage.error %}
+                                    <span>{{ stage.error }}</span>
+                                {% endif %}
+                            </div>
+                        {% endfor %}
+                    </div>
+                {% else %}
+                    <div class="video-frame placeholder">
+                        <div>
+                            <strong style="display:block; color: var(--accent); margin-bottom:10px;">Chưa có stream đang chạy</strong>
+                            Điền cấu hình bên trái rồi bấm <em>Chạy Pipeline</em> để chạy các stage đã chọn trên web.
+                        </div>
+                    </div>
+                {% endif %}
+            </section>
+        </div>
+    </div>
+    <script>
+        (() => {
+            const person = document.getElementById("run_person_detection");
+            const region = document.getElementById("run_region_extraction");
+            const facemask = document.getElementById("run_facemask_detection");
+            const glove = document.getElementById("run_glove_detection");
+
+            if (!person || !region || !facemask || !glove) {
+                return;
+            }
+
+            function syncStageDependencies(changedStage) {
+                if (changedStage === "person" && !person.checked) {
+                    region.checked = false;
+                    facemask.checked = false;
+                    glove.checked = false;
+                }
+
+                if (changedStage === "region" && !region.checked) {
+                    facemask.checked = false;
+                    glove.checked = false;
+                }
+
+                if (facemask.checked || glove.checked) {
+                    region.checked = true;
+                }
+
+                if (region.checked) {
+                    person.checked = true;
+                }
+            }
+
+            person.addEventListener("change", () => syncStageDependencies("person"));
+            region.addEventListener("change", () => syncStageDependencies("region"));
+            facemask.addEventListener("change", () => syncStageDependencies("facemask"));
+            glove.addEventListener("change", () => syncStageDependencies("glove"));
+
+            syncStageDependencies("init");
+        })();
+    </script>
+</body>
+</html>

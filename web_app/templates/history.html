@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lịch Sử Xử Lý</title>
+    <style>
+        body {
+            font-family: "Segoe UI", Arial, sans-serif;
+            background: #050505;
+            color: #ececec;
+            margin: 0;
+            padding: 24px;
+        }
+        .shell {
+            width: min(1200px, calc(100vw - 24px));
+            margin: 0 auto;
+        }
+        h1 {
+            color: #00ff88;
+            margin-top: 0;
+        }
+        .btn {
+            display: inline-block;
+            margin-bottom: 18px;
+            padding: 10px 18px;
+            border: 2px solid #00ff88;
+            color: #00ff88;
+            text-decoration: none;
+            border-radius: 10px;
+            font-weight: 700;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: #0d0d0d;
+            border-radius: 16px;
+            overflow: hidden;
+        }
+        th, td {
+            padding: 14px 12px;
+            border-bottom: 1px solid #202020;
+            text-align: left;
+            vertical-align: top;
+        }
+        th {
+            color: #00ff88;
+            background: #090909;
+        }
+        a {
+            color: #7dd3fc;
+            text-decoration: none;
+        }
+        .muted {
+            color: #8a8a8a;
+        }
+    </style>
+</head>
+<body>
+    <div class="shell">
+        <a class="btn" href="{{ url_for('index') }}">Quay Lại Dashboard</a>
+        <h1>Lịch Sử Xử Lý</h1>
+        <table>
+            <thead>
+                <tr>
+                    <th>Job ID</th>
+                    <th>Source</th>
+                    <th>Status</th>
+                    <th>Stage</th>
+                    <th>Alerts</th>
+                    <th>Tracks</th>
+                    <th>Output</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for job in jobs %}
+                <tr>
+                    <td>{{ job.job_id }}</td>
+                    <td>{{ job.source_name }}</td>
+                    <td>{{ job.status }}</td>
+                    <td>{{ job.current_stage or '-' }}</td>
+                    <td>{{ job.total_alerts }}</td>
+                    <td>{{ job.unique_track_count }}</td>
+                    <td>
+                        <a href="{{ url_for('index', job_id=job.job_id) }}">Mở Stream</a><br>
+                        <span class="muted">{{ job.pipeline_output_root or job.crop_dir }}</span>
+                    </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="7" class="muted">Chưa có job nào được tạo.</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</body>
+</html>
