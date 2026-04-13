@@ -10,3 +10,4 @@ dist/
 build/
 vid_test/
 venv/
+*.pt
