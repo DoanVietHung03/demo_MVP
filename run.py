@@ -632,6 +632,10 @@ def run_job_worker(job_id: str) -> None:
             track_ttl_frames=int(job["track_ttl_frames"]),
             alert_cooldown_frames=job["alert_cooldown_frames"],
         )
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps <= 0:
+            fps = 25.0
+        frame_delay = 1.0 / fps
         frame_skip = max(0, int(job["frame_skip"]))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -649,6 +653,7 @@ def run_job_worker(job_id: str) -> None:
             job["status"] = "streaming"
 
         while True:
+            start_time = time.time()
             ok, frame = cap.read()
             if not ok:
                 break
@@ -663,6 +668,13 @@ def run_job_worker(job_id: str) -> None:
             writer.write(annotated_frame)
 
             frame_index += 1
+            
+            elapsed_time = time.time() - start_time
+            sleep_time = frame_delay - elapsed_time
+            
+            # Chỉ sleep nếu thời gian xử lý nhanh hơn tốc độ thật của video
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
         with job["lock"]:
             job["status"] = "completed"
