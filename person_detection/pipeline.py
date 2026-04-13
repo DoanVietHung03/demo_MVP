@@ -14,6 +14,26 @@ from person_detection.inference import YOLOPersonInference, infer_person_detecti
 
 
 log_queue: "queue.Queue[Tuple[str, str, Optional[np.ndarray], Optional[str]]]" = queue.Queue(maxsize=4096)
+log_queue_drop_count = 0
+log_queue_drop_lock = threading.Lock()
+
+
+def _warn_log_queue_drop(
+    item_type: str,
+    path: Union[str, Path],
+) -> None:
+    global log_queue_drop_count
+
+    with log_queue_drop_lock:
+        log_queue_drop_count += 1
+        dropped_count = log_queue_drop_count
+
+    if dropped_count == 1 or dropped_count % 100 == 0:
+        print(
+            "[Async Logger Warning] "
+            f"Queue full, dropped {dropped_count} item(s). "
+            f"Last item_type={item_type} path={path}"
+        )
 
 
 def _write_log_item(
@@ -51,11 +71,13 @@ def enqueue_log_item(
     path: Union[str, Path],
     image: Optional[np.ndarray] = None,
     text: Optional[str] = None,
-) -> None:
+) -> bool:
     try:
         log_queue.put_nowait((item_type, str(path), image, text))
+        return True
     except queue.Full:
-        pass
+        _warn_log_queue_drop(item_type, path)
+        return False
 
 
 threading.Thread(target=async_logger_worker, daemon=True).start()

@@ -134,6 +134,19 @@ def infer_filtered_detections(
     frame: np.ndarray,
     target_class_names: Sequence[str],
 ) -> sv.Detections:
+    detections = infer_detections(inference_engine, frame)
+    return filter_detections_by_class_names(
+        inference_engine,
+        detections,
+        target_class_names,
+        confidence_threshold=inference_engine.confidence_threshold,
+    )
+
+
+def infer_detections(
+    inference_engine: YOLODetectionInference,
+    frame: np.ndarray,
+) -> sv.Detections:
     inference_frame, resize_scale = _resize_frame_for_inference(
         frame,
         float(inference_engine.input_resize_scale),
@@ -151,6 +164,17 @@ def infer_filtered_detections(
 
     if resize_scale != 1.0:
         detections.xyxy = detections.xyxy / resize_scale
+    return detections
+
+
+def filter_detections_by_class_names(
+    inference_engine: YOLODetectionInference,
+    detections: sv.Detections,
+    target_class_names: Sequence[str],
+    confidence_threshold: Optional[float] = None,
+) -> sv.Detections:
+    if len(detections) == 0 or detections.class_id is None:
+        return detections
 
     allowed_ids: List[int] = []
     for class_name in target_class_names:
@@ -161,7 +185,15 @@ def infer_filtered_detections(
         return detections[np.array([], dtype=int)]
 
     class_mask = np.isin(detections.class_id, np.asarray(allowed_ids))
-    return detections[class_mask]
+    confidence_mask = np.ones(len(detections), dtype=bool)
+    if confidence_threshold is not None:
+        confidence_array = detections.confidence
+        if confidence_array is None:
+            confidence_mask = np.zeros(len(detections), dtype=bool)
+        else:
+            confidence_mask = confidence_array >= float(confidence_threshold)
+
+    return detections[class_mask & confidence_mask]
 
 
 def infer_pose_people(

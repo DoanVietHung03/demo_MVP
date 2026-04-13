@@ -15,6 +15,8 @@ try:
         PosePerson,
         YOLODetectionInference,
         YOLOPoseInference,
+        filter_detections_by_class_names,
+        infer_detections,
         infer_filtered_detections,
         infer_pose_people,
         load_yolo_detection_inference,
@@ -26,6 +28,8 @@ except ModuleNotFoundError:  # pragma: no cover - convenience for direct script 
         PosePerson,
         YOLODetectionInference,
         YOLOPoseInference,
+        filter_detections_by_class_names,
+        infer_detections,
         infer_filtered_detections,
         infer_pose_people,
         load_yolo_detection_inference,
@@ -232,10 +236,17 @@ def _update_streak(previous_value: int, condition: bool) -> int:
 class BehaviorDetectionPipeline:
     def __init__(self, config: BehaviorDetectionConfig) -> None:
         self.config = config
+        self.person_confidence_threshold = float(config.person_confidence_threshold)
+        self.phone_confidence_threshold = float(config.phone_confidence_threshold)
+        # Run the shared detector once per frame at the lower threshold, then
+        # apply the class-specific thresholds after inference.
         self.person_phone_engine: YOLODetectionInference = load_yolo_detection_inference(
             model_path=config.person_phone_model_path,
             device=config.device,
-            confidence_threshold=min(config.person_confidence_threshold, config.phone_confidence_threshold),
+            confidence_threshold=min(
+                self.person_confidence_threshold,
+                self.phone_confidence_threshold,
+            ),
             iou_threshold=config.iou_threshold,
             input_resize_scale=config.input_resize_scale,
         )
@@ -301,22 +312,34 @@ class BehaviorDetectionPipeline:
             details=details,
         )
 
+    def _infer_person_and_phone_detections(
+        self,
+        frame: np.ndarray,
+    ) -> Tuple[sv.Detections, sv.Detections]:
+        shared_detections = infer_detections(self.person_phone_engine, frame)
+        person_detections = filter_detections_by_class_names(
+            self.person_phone_engine,
+            shared_detections,
+            ["person"],
+            confidence_threshold=self.person_confidence_threshold,
+        )
+        phone_detections = filter_detections_by_class_names(
+            self.person_phone_engine,
+            shared_detections,
+            ["cell phone"],
+            confidence_threshold=self.phone_confidence_threshold,
+        )
+        return person_detections, phone_detections
+
     def process_frame(
         self,
         frame: np.ndarray,
         frame_index: int,
     ) -> Tuple[np.ndarray, List[TrackedPersonBehavior], List[BehaviorEvent]]:
-        person_detections = infer_filtered_detections(
-            self.person_phone_engine,
-            frame,
-            ["person"],
+        person_detections, phone_detections = self._infer_person_and_phone_detections(
+            frame
         )
         tracked_detections = self.tracker.update_with_detections(person_detections)
-        phone_detections = infer_filtered_detections(
-            self.person_phone_engine,
-            frame,
-            ["cell phone"],
-        )
         smoke_detections = infer_filtered_detections(
             self.smoke_engine,
             frame,

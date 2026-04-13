@@ -36,7 +36,12 @@ def resolve_input_head_face_dir(config: FaceMaskConfig) -> Tuple[Path, str]:
         input_dir = Path(config.input_head_face_dir)
         if not input_dir.exists():
             raise FileNotFoundError(f"Input head_face directory not found: {input_dir}")
-        return input_dir, input_dir.parent.name
+        return input_dir, input_dir.name
+
+    if not config.process_latest_job:
+        raise ValueError(
+            "input_head_face_dir must be set when process_latest_job is False."
+        )
 
     results_root = Path(config.results_root)
     if not results_root.exists():

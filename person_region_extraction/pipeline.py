@@ -70,6 +70,26 @@ def _crop(image: np.ndarray, box: Tuple[int, int, int, int]) -> np.ndarray:
     return image[y1:y2, x1:x2].copy()
 
 
+def _ensure_min_image_size(
+    image: np.ndarray,
+    min_size: int,
+) -> np.ndarray:
+    if image.size == 0 or min_size <= 1:
+        return image
+
+    height, width = image.shape[:2]
+    if height >= min_size and width >= min_size:
+        return image
+
+    resized_width = max(width, min_size)
+    resized_height = max(height, min_size)
+    return cv2.resize(
+        image,
+        (resized_width, resized_height),
+        interpolation=cv2.INTER_LINEAR,
+    )
+
+
 def _concat_hand_regions(left: np.ndarray, right: np.ndarray) -> np.ndarray:
     if left.size == 0 and right.size == 0:
         return np.empty((0, 0, 3), dtype=np.uint8)
@@ -115,6 +135,66 @@ def _xyxy_from_points(
     )
 
 
+def _bbox_area(xyxy: np.ndarray) -> float:
+    return max(1.0, float(xyxy[2] - xyxy[0])) * max(1.0, float(xyxy[3] - xyxy[1]))
+
+
+def _bbox_contains_point(
+    xyxy: np.ndarray,
+    point: Tuple[float, float],
+) -> bool:
+    return (
+        float(xyxy[0]) <= point[0] <= float(xyxy[2])
+        and float(xyxy[1]) <= point[1] <= float(xyxy[3])
+    )
+
+
+def _select_primary_person_index(
+    person_indices: np.ndarray,
+    boxes_xyxy: np.ndarray,
+    confidences: Optional[np.ndarray],
+    image_shape: Tuple[int, int, int],
+) -> int:
+    if person_indices.size == 0:
+        raise ValueError("person_indices must not be empty.")
+    if person_indices.size == 1:
+        return int(person_indices[0])
+
+    height, width = image_shape[:2]
+    crop_center = (width / 2.0, height / 2.0)
+    crop_area = max(1.0, float(width * height))
+    crop_diag = max(1.0, float(np.hypot(width, height)))
+
+    best_index = int(person_indices[0])
+    best_score: Optional[Tuple[int, float, float, float]] = None
+
+    for person_index_raw in person_indices:
+        person_index = int(person_index_raw)
+        box = boxes_xyxy[person_index]
+        box_center = (
+            float(box[0] + box[2]) / 2.0,
+            float(box[1] + box[3]) / 2.0,
+        )
+        center_distance = float(
+            np.hypot(box_center[0] - crop_center[0], box_center[1] - crop_center[1])
+        ) / crop_diag
+        area_ratio = _bbox_area(box) / crop_area
+        confidence_score = (
+            float(confidences[person_index]) if confidences is not None else 0.0
+        )
+        candidate_score = (
+            int(_bbox_contains_point(box, crop_center)),
+            area_ratio,
+            -center_distance,
+            confidence_score,
+        )
+        if best_score is None or candidate_score > best_score:
+            best_score = candidate_score
+            best_index = person_index
+
+    return best_index
+
+
 class PersonRegionExtractor:
     def __init__(self, config: RegionExtractionConfig) -> None:
         self.config = config
@@ -156,12 +236,14 @@ class PersonRegionExtractor:
         if person_indices.size == 0:
             return None
 
+        boxes_xyxy = boxes.xyxy.detach().cpu().numpy()
         conf_tensor = boxes.conf.detach().cpu().numpy() if boxes.conf is not None else None
-        chosen_index = int(person_indices[0])
-        if conf_tensor is not None:
-            chosen_index = int(
-                person_indices[np.argmax(conf_tensor[person_indices])]
-            )
+        chosen_index = _select_primary_person_index(
+            person_indices,
+            boxes_xyxy,
+            conf_tensor,
+            image.shape,
+        )
 
         keypoints_xy = keypoints.xy[chosen_index].detach().cpu().numpy()
         keypoints_conf_tensor = getattr(keypoints, "conf", None)
@@ -325,13 +407,22 @@ class PersonRegionExtractor:
         right_box = _clip_box(width - side_width, y1, width, y2, width, height)
         return _concat_hand_regions(_crop(image, left_box), _crop(image, right_box))
 
+    def _ensure_min_face_crop_size(self, head_face_crop: np.ndarray) -> np.ndarray:
+        return _ensure_min_image_size(
+            head_face_crop,
+            int(self.config.min_face_size),
+        )
+
     def split_regions(self, image: np.ndarray) -> RegionResult:
         pose = self._predict_pose(image)
         head_face_bbox = self._estimate_head_face_bbox(image, pose)
         torso_bbox = self._estimate_torso_bbox(image, pose, head_face_bbox)
         hands_crop = self._estimate_hands_crop(image, pose)
+        head_face_crop = self._ensure_min_face_crop_size(
+            _crop(image, head_face_bbox)
+        )
         return RegionResult(
-            head_face=_crop(image, head_face_bbox),
+            head_face=head_face_crop,
             hands=hands_crop,
             torso=_crop(image, torso_bbox),
             face_bbox=head_face_bbox,
@@ -344,6 +435,11 @@ def resolve_input_crops_dir(config: RegionExtractionConfig) -> Tuple[Path, str]:
         if not input_dir.exists():
             raise FileNotFoundError(f"Input crops directory not found: {input_dir}")
         return input_dir, input_dir.parent.name
+
+    if not config.process_latest_job:
+        raise ValueError(
+            "input_crops_dir must be set when process_latest_job is False."
+        )
 
     results_root = Path(config.results_root)
     if not results_root.exists():

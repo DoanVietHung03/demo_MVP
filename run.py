@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import tempfile
 import threading
 import time
@@ -27,6 +28,10 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024 * 1024
 
 JOB_STORE: Dict[str, Dict[str, object]] = {}
+JOB_STORE_LOCK = threading.Lock()
+ACTIVE_JOB_STATUSES = {"ready", "initializing", "streaming"}
+MAX_CONCURRENT_WEB_JOBS = 1
+MAX_RETAINED_TERMINAL_JOBS = 10
 
 
 HTML_TEMPLATE = """
@@ -457,6 +462,117 @@ def _defaults() -> Dict[str, object]:
     }
 
 
+def _snapshot_jobs() -> List[tuple[str, Dict[str, object]]]:
+    with JOB_STORE_LOCK:
+        return list(JOB_STORE.items())
+
+
+def _get_job(job_id: str) -> Optional[Dict[str, object]]:
+    with JOB_STORE_LOCK:
+        return JOB_STORE.get(job_id)
+
+
+def _job_created_at(job: Dict[str, object]) -> float:
+    lock = job["lock"]
+    with lock:
+        return float(job.get("created_at", 0.0))
+
+
+def _job_finished_at(job: Dict[str, object]) -> float:
+    lock = job["lock"]
+    with lock:
+        finished_at = job.get("finished_at")
+        created_at = job.get("created_at", 0.0)
+    if finished_at is None:
+        return float(created_at)
+    return float(finished_at)
+
+
+def _job_status(job: Dict[str, object]) -> str:
+    lock = job["lock"]
+    with lock:
+        return str(job["status"])
+
+
+def _is_terminal_status(status: str) -> bool:
+    return status == "completed" or status.startswith("error")
+
+
+def _is_active_status(status: str) -> bool:
+    return status in ACTIVE_JOB_STATUSES
+
+
+def _sorted_job_items() -> List[tuple[str, Dict[str, object]]]:
+    items = _snapshot_jobs()
+    items.sort(key=lambda item: _job_created_at(item[1]), reverse=True)
+    return items
+
+
+def _cleanup_path(path_value: Optional[object], is_dir: bool) -> None:
+    if not path_value:
+        return
+
+    path = Path(str(path_value))
+    if is_dir:
+        shutil.rmtree(path, ignore_errors=True)
+        return
+
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except IsADirectoryError:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def _cleanup_job_artifacts(job: Dict[str, object]) -> None:
+    lock = job["lock"]
+    with lock:
+        job_dir = job.get("job_dir")
+        source_is_upload = bool(job.get("source_is_upload"))
+        uploaded_source_path = job.get("uploaded_source_path") if source_is_upload else None
+
+    _cleanup_path(job_dir, is_dir=True)
+    _cleanup_path(uploaded_source_path, is_dir=False)
+
+
+def _prune_finished_jobs(
+    max_terminal_jobs: int = MAX_RETAINED_TERMINAL_JOBS,
+) -> None:
+    terminal_jobs: List[tuple[float, str]] = []
+    for job_id, job in _sorted_job_items():
+        status = _job_status(job)
+        if _is_terminal_status(status):
+            terminal_jobs.append((_job_finished_at(job), job_id))
+
+    terminal_jobs.sort(reverse=True)
+    for _, job_id in terminal_jobs[max_terminal_jobs:]:
+        with JOB_STORE_LOCK:
+            job = JOB_STORE.pop(job_id, None)
+        if job is not None:
+            _cleanup_job_artifacts(job)
+
+
+def _get_active_job_views() -> List[Dict[str, object]]:
+    active_jobs: List[Dict[str, object]] = []
+    for job_id, job in _sorted_job_items():
+        if _is_active_status(_job_status(job)):
+            active_jobs.append(_job_to_view(job_id, job))
+    return active_jobs
+
+
+def _resolve_current_job_view(selected_job_id: Optional[str]) -> Optional[Dict[str, object]]:
+    if selected_job_id:
+        job = _get_job(selected_job_id)
+        if job is not None:
+            return _job_to_view(selected_job_id, job)
+
+    active_jobs = _get_active_job_views()
+    if active_jobs:
+        return active_jobs[0]
+    return None
+
+
 def _job_to_view(job_id: str, job: Dict[str, object]) -> Dict[str, object]:
     lock = job["lock"]
     with lock:
@@ -473,10 +589,9 @@ def _job_to_view(job_id: str, job: Dict[str, object]) -> Dict[str, object]:
 
 @app.get("/")
 def index():
+    _prune_finished_jobs()
     selected_job_id = request.args.get("job_id")
-    current_job = None
-    if selected_job_id and selected_job_id in JOB_STORE:
-        current_job = _job_to_view(selected_job_id, JOB_STORE[selected_job_id])
+    current_job = _resolve_current_job_view(selected_job_id)
     return render_template_string(
         HTML_TEMPLATE,
         defaults=_defaults(),
@@ -487,10 +602,24 @@ def index():
 
 @app.post("/start")
 def start_job():
+    _prune_finished_jobs()
+    active_jobs = _get_active_job_views()
+    if len(active_jobs) >= MAX_CONCURRENT_WEB_JOBS:
+        return render_template_string(
+            HTML_TEMPLATE,
+            defaults=_defaults(),
+            current_job=active_jobs[0],
+            error=(
+                "Hiện chỉ cho phép 1 job đang chạy cùng lúc để tránh quá tải model/GPU. "
+                "Hãy chờ job hiện tại hoàn tất rồi thử lại."
+            ),
+        )
+
     source_file = request.files.get("source_file")
     source_path = (request.form.get("source_path") or "").strip()
+    is_uploaded_source = bool(source_file and source_file.filename)
 
-    if source_file and source_file.filename:
+    if is_uploaded_source:
         video_source = _save_uploaded_file(source_file)
         source_name = source_file.filename
     elif source_path:
@@ -507,8 +636,9 @@ def start_job():
     job_id = uuid.uuid4().hex[:12]
     job_dir = RESULT_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
+    created_at = time.time()
 
-    JOB_STORE[job_id] = {
+    job_payload: Dict[str, object] = {
         "source": str(video_source),
         "source_name": source_name,
         "model_path": (request.form.get("model_path") or CONFIG.model_path).strip(),
@@ -531,18 +661,25 @@ def start_job():
         ),
         "max_frames": _parse_optional_int(request.form.get("max_frames")),
         "crop_dir": str(job_dir / "crops"),
+        "job_dir": str(job_dir),
+        "source_is_upload": is_uploaded_source,
+        "uploaded_source_path": str(video_source) if is_uploaded_source else None,
         "status": "ready",
         "total_alerts": 0,
         "unique_track_count": 0,
         "last_frame_index": -1,
-        "alert_messages": [],
         "unique_ids": set(),
         "latest_frame_jpeg": None,
         "latest_frame_seq": -1,
+        "created_at": created_at,
+        "finished_at": None,
         "lock": threading.Lock(),
     }
+    with JOB_STORE_LOCK:
+        JOB_STORE[job_id] = job_payload
     worker = threading.Thread(target=run_job_worker, args=(job_id,), daemon=True)
-    JOB_STORE[job_id]["worker"] = worker
+    with JOB_STORE_LOCK:
+        JOB_STORE[job_id]["worker"] = worker
     worker.start()
     return redirect(url_for("index", job_id=job_id))
 
@@ -553,28 +690,24 @@ def _update_job_outputs(
     persons: List[PersonInstance],
     frame_index: int,
 ) -> None:
-    job = JOB_STORE[job_id]
+    job = _get_job(job_id)
+    if job is None:
+        return
     crop_dir = Path(job["crop_dir"])
     crop_dir.mkdir(parents=True, exist_ok=True)
     crop_save_interval = max(1, int(job.get("crop_save_interval", 10)))
-
-    with job["lock"]:
-        unique_ids = set(job.get("unique_ids", set()))
-        alert_messages = list(job["alert_messages"])
+    seen_tracker_ids = set()
+    new_alert_count = 0
 
     for person in persons:
-        unique_ids.add(person.tracker_id)
+        seen_tracker_ids.add(person.tracker_id)
         if frame_index % crop_save_interval == 0:
             person_dir = crop_dir / f"track_{person.tracker_id}"
             person_dir.mkdir(parents=True, exist_ok=True)
             crop_path = person_dir / f"frame_{frame_index:06d}.jpg"
             enqueue_log_item("crop", crop_path, image=person.crop.copy())
         if person.should_alert:
-            alert_line = (
-                f"frame={frame_index} | track_id={person.tracker_id} | "
-                f"bbox={person.bbox_xyxy} | conf={person.confidence:.2f}"
-            )
-            alert_messages.append(alert_line)
+            new_alert_count += 1
 
     latest_frame_jpeg = None
     ok_encode, buffer = cv2.imencode(
@@ -584,10 +717,13 @@ def _update_job_outputs(
         latest_frame_jpeg = buffer.tobytes()
 
     with job["lock"]:
+        unique_ids = job.get("unique_ids")
+        if not isinstance(unique_ids, set):
+            unique_ids = set()
+        unique_ids.update(seen_tracker_ids)
         job["unique_ids"] = unique_ids
         job["unique_track_count"] = len(unique_ids)
-        job["alert_messages"] = alert_messages
-        job["total_alerts"] = len(alert_messages)
+        job["total_alerts"] = int(job.get("total_alerts", 0)) + new_alert_count
         job["last_frame_index"] = frame_index
         if latest_frame_jpeg is not None:
             job["latest_frame_jpeg"] = latest_frame_jpeg
@@ -595,24 +731,26 @@ def _update_job_outputs(
 
 
 def run_job_worker(job_id: str) -> None:
-    job = JOB_STORE.get(job_id)
+    job = _get_job(job_id)
     if job is None:
         return
 
     with job["lock"]:
-        job["alert_messages"] = []
         job["unique_ids"] = set()
         job["total_alerts"] = 0
         job["unique_track_count"] = 0
         job["last_frame_index"] = -1
         job["latest_frame_jpeg"] = None
         job["latest_frame_seq"] = -1
+        job["finished_at"] = None
         job["status"] = "initializing"
 
     cap = cv2.VideoCapture(str(job["source"]))
     if not cap.isOpened():
         with job["lock"]:
             job["status"] = "error"
+            job["finished_at"] = time.time()
+        _prune_finished_jobs()
         return
 
     frame_index = 0
@@ -650,15 +788,18 @@ def run_job_worker(job_id: str) -> None:
 
         with job["lock"]:
             job["status"] = "completed"
+            job["finished_at"] = time.time()
     except Exception as exc:
         with job["lock"]:
             job["status"] = f"error: {exc}"
+            job["finished_at"] = time.time()
     finally:
         cap.release()
+        _prune_finished_jobs()
 
 
 def generate_web_stream(job_id: str):
-    job = JOB_STORE.get(job_id)
+    job = _get_job(job_id)
     if job is None:
         return
 
@@ -687,7 +828,7 @@ def generate_web_stream(job_id: str):
 
 @app.get("/video_feed/<job_id>")
 def video_feed(job_id: str):
-    if job_id not in JOB_STORE:
+    if _get_job(job_id) is None:
         abort(404)
     return Response(
         generate_web_stream(job_id),
@@ -697,9 +838,10 @@ def video_feed(job_id: str):
 
 @app.get("/history")
 def history():
+    _prune_finished_jobs()
     jobs = [
         _job_to_view(job_id, job)
-        for job_id, job in sorted(JOB_STORE.items(), reverse=True)
+        for job_id, job in _sorted_job_items()
     ]
     return render_template_string(HISTORY_TEMPLATE, jobs=jobs)
 
