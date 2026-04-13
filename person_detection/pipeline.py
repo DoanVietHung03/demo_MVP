@@ -102,7 +102,7 @@ class TrackAlertMemory:
 class PersonDetectionPipeline:
     def __init__(
         self,
-        model_path: str = "yolo11n.pt",
+        model_path: str = "./weights/yolo11n.pt",
         device: str = "cuda:0",
         confidence_threshold: float = 0.35,
         iou_threshold: float = 0.45,
@@ -225,8 +225,8 @@ class PersonDetectionPipeline:
         self,
         source: Union[str, int],
         output_dir: Optional[Union[str, Path]] = None,
-        output_video_path: Optional[Union[str, Path]] = None,
         frame_skip: int = 0,
+        crop_save_interval: int = 10,
         max_frames: Optional[int] = None,
         frame_callback: Optional[
             Callable[[int, Optional[int], np.ndarray, List[PersonInstance]], None]
@@ -236,26 +236,12 @@ class PersonDetectionPipeline:
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open video source: {source}")
 
-        writer = None
         total_frames_raw = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         total_frames = total_frames_raw if total_frames_raw > 0 else None
         output_root = Path(output_dir) if output_dir else None
         if output_root is not None:
             output_root.mkdir(parents=True, exist_ok=True)
-
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-        if output_video_path:
-            output_video = Path(output_video_path)
-            output_video.parent.mkdir(parents=True, exist_ok=True)
-            writer = cv2.VideoWriter(
-                str(output_video),
-                cv2.VideoWriter_fourcc(*"mp4v"),
-                fps if fps > 0 else 25.0,
-                (width, height),
-            )
+        crop_interval = max(1, int(crop_save_interval))
 
         frame_index = 0
         try:
@@ -272,7 +258,7 @@ class PersonDetectionPipeline:
                 annotated_frame, persons = self.process_frame(frame, frame_index)
 
                 for person in persons:
-                    if output_root is not None:
+                    if output_root is not None and frame_index % crop_interval == 0:
                         person_dir = output_root / f"track_{person.tracker_id}"
                         person_dir.mkdir(parents=True, exist_ok=True)
                         crop_path = person_dir / f"frame_{frame_index:06d}.jpg"
@@ -289,11 +275,6 @@ class PersonDetectionPipeline:
                 if frame_callback is not None:
                     frame_callback(frame_index, total_frames, annotated_frame, persons)
 
-                if writer is not None:
-                    writer.write(annotated_frame)
-
                 frame_index += 1
         finally:
             cap.release()
-            if writer is not None:
-                writer.release()

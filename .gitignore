@@ -11,3 +11,5 @@ build/
 vid_test/
 venv/
 *.pt
+weights/
+logs/

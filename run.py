@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import cv2
-from flask import Flask, Response, abort, redirect, render_template_string, request, send_from_directory, url_for
+from flask import Flask, Response, abort, redirect, render_template_string, request, url_for
 
 from person_detection.config import CONFIG, PersonInstance
 from person_detection.pipeline import PersonDetectionPipeline, enqueue_log_item
@@ -23,7 +23,7 @@ WEB_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
-app = Flask(__name__, static_folder=str(RESULT_DIR), static_url_path="/results")
+app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024 * 1024
 
 JOB_STORE: Dict[str, Dict[str, object]] = {}
@@ -245,7 +245,7 @@ HTML_TEMPLATE = """
                             <input type="file" name="source_file" accept=".mp4,video/mp4">
                         </label>
                     </div>
-                    <div class="hint">Nếu nhập cả hai, file upload sẽ được ưu tiên. `YOLO(...)` sẽ tự tải model hợp lệ như `yolo11n.pt` nếu chưa có local.</div>
+                    <div class="hint">Nếu nhập cả hai, file upload sẽ được ưu tiên. `YOLO(...)` sẽ tự tải model hợp lệ như `yolo11n.pt` nếu chưa có local. App chỉ lưu crop mỗi 10 frame để tránh phình `web_output`.</div>
                     <div class="grid two">
                         <label>
                             Model
@@ -399,7 +399,7 @@ HISTORY_TEMPLATE = """
                     <th>Status</th>
                     <th>Alerts</th>
                     <th>Tracks</th>
-                    <th>Tệp Kết Quả</th>
+                    <th>Crop</th>
                 </tr>
             </thead>
             <tbody>
@@ -412,8 +412,7 @@ HISTORY_TEMPLATE = """
                     <td>{{ job.unique_track_count }}</td>
                     <td>
                         <a href="{{ url_for('index', job_id=job.job_id) }}">Mở Stream</a><br>
-                        <a href="{{ url_for('serve_result_file', job_id=job.job_id, filename='annotated.mp4') }}">Video</a><br>
-                        <a href="{{ url_for('serve_result_file', job_id=job.job_id, filename='alerts.txt') }}">Alerts</a>
+                        <span class="muted">{{ job.crop_dir }}</span>
                     </td>
                 </tr>
                 {% else %}
@@ -451,6 +450,7 @@ def _defaults() -> Dict[str, object]:
         "crop_padding": CONFIG.crop_padding,
         "input_resize_scale": CONFIG.input_resize_scale,
         "frame_skip": CONFIG.frame_skip,
+        "crop_save_interval": CONFIG.crop_save_interval,
         "track_ttl_frames": CONFIG.track_ttl_frames,
         "alert_cooldown_frames": CONFIG.alert_cooldown_frames,
         "max_frames": CONFIG.max_frames,
@@ -467,6 +467,7 @@ def _job_to_view(job_id: str, job: Dict[str, object]) -> Dict[str, object]:
             "status": job["status"],
             "total_alerts": job["total_alerts"],
             "unique_track_count": job["unique_track_count"],
+            "crop_dir": job["crop_dir"],
         }
 
 
@@ -521,6 +522,7 @@ def start_job():
             request.form.get("input_resize_scale") or CONFIG.input_resize_scale
         ),
         "frame_skip": int(request.form.get("frame_skip") or CONFIG.frame_skip),
+        "crop_save_interval": CONFIG.crop_save_interval,
         "track_ttl_frames": int(
             request.form.get("track_ttl_frames") or CONFIG.track_ttl_frames
         ),
@@ -529,8 +531,6 @@ def start_job():
         ),
         "max_frames": _parse_optional_int(request.form.get("max_frames")),
         "crop_dir": str(job_dir / "crops"),
-        "output_video_path": str(job_dir / "annotated.mp4"),
-        "alerts_path": str(job_dir / "alerts.txt"),
         "status": "ready",
         "total_alerts": 0,
         "unique_track_count": 0,
@@ -556,6 +556,7 @@ def _update_job_outputs(
     job = JOB_STORE[job_id]
     crop_dir = Path(job["crop_dir"])
     crop_dir.mkdir(parents=True, exist_ok=True)
+    crop_save_interval = max(1, int(job.get("crop_save_interval", 10)))
 
     with job["lock"]:
         unique_ids = set(job.get("unique_ids", set()))
@@ -563,17 +564,17 @@ def _update_job_outputs(
 
     for person in persons:
         unique_ids.add(person.tracker_id)
-        person_dir = crop_dir / f"track_{person.tracker_id}"
-        person_dir.mkdir(parents=True, exist_ok=True)
-        crop_path = person_dir / f"frame_{frame_index:06d}.jpg"
-        enqueue_log_item("crop", crop_path, image=person.crop.copy())
+        if frame_index % crop_save_interval == 0:
+            person_dir = crop_dir / f"track_{person.tracker_id}"
+            person_dir.mkdir(parents=True, exist_ok=True)
+            crop_path = person_dir / f"frame_{frame_index:06d}.jpg"
+            enqueue_log_item("crop", crop_path, image=person.crop.copy())
         if person.should_alert:
             alert_line = (
                 f"frame={frame_index} | track_id={person.tracker_id} | "
                 f"bbox={person.bbox_xyxy} | conf={person.confidence:.2f}"
             )
             alert_messages.append(alert_line)
-            enqueue_log_item("alert", job["alerts_path"], text=alert_line)
 
     latest_frame_jpeg = None
     ok_encode, buffer = cv2.imencode(
@@ -607,18 +608,13 @@ def run_job_worker(job_id: str) -> None:
         job["latest_frame_jpeg"] = None
         job["latest_frame_seq"] = -1
         job["status"] = "initializing"
-    Path(str(job["alerts_path"])).write_text("", encoding="utf-8")
 
     cap = cv2.VideoCapture(str(job["source"]))
     if not cap.isOpened():
         with job["lock"]:
             job["status"] = "error"
-        Path(job["alerts_path"]).write_text(
-            f"Cannot open video source: {job['source']}\n", encoding="utf-8"
-        )
         return
 
-    writer = None
     frame_index = 0
 
     try:
@@ -632,28 +628,12 @@ def run_job_worker(job_id: str) -> None:
             track_ttl_frames=int(job["track_ttl_frames"]),
             alert_cooldown_frames=job["alert_cooldown_frames"],
         )
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        if fps <= 0:
-            fps = 25.0
-        frame_delay = 1.0 / fps
         frame_skip = max(0, int(job["frame_skip"]))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        output_video_path = Path(str(job["output_video_path"]))
-        output_video_path.parent.mkdir(parents=True, exist_ok=True)
-        writer = cv2.VideoWriter(
-            str(output_video_path),
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            fps if fps > 0 else 25.0,
-            (width, height),
-        )
 
         with job["lock"]:
             job["status"] = "streaming"
 
         while True:
-            start_time = time.time()
             ok, frame = cap.read()
             if not ok:
                 break
@@ -665,16 +645,8 @@ def run_job_worker(job_id: str) -> None:
 
             annotated_frame, persons = pipeline.process_frame(frame, frame_index)
             _update_job_outputs(job_id, annotated_frame, persons, frame_index)
-            writer.write(annotated_frame)
 
             frame_index += 1
-            
-            elapsed_time = time.time() - start_time
-            sleep_time = frame_delay - elapsed_time
-            
-            # Chỉ sleep nếu thời gian xử lý nhanh hơn tốc độ thật của video
-            if sleep_time > 0:
-                time.sleep(sleep_time)
 
         with job["lock"]:
             job["status"] = "completed"
@@ -683,15 +655,6 @@ def run_job_worker(job_id: str) -> None:
             job["status"] = f"error: {exc}"
     finally:
         cap.release()
-        if writer is not None:
-            writer.release()
-        alerts_path = Path(str(job["alerts_path"]))
-        with job["lock"]:
-            alert_lines = (
-                list(job["alert_messages"]) if job["alert_messages"] else ["No new alerts."]
-            )
-        if not alerts_path.exists() or alerts_path.stat().st_size == 0:
-            alerts_path.write_text("\n".join(alert_lines) + "\n", encoding="utf-8")
 
 
 def generate_web_stream(job_id: str):
@@ -739,14 +702,6 @@ def history():
         for job_id, job in sorted(JOB_STORE.items(), reverse=True)
     ]
     return render_template_string(HISTORY_TEMPLATE, jobs=jobs)
-
-
-@app.get("/result/<job_id>/files/<path:filename>")
-def serve_result_file(job_id: str, filename: str):
-    job_dir = RESULT_DIR / job_id
-    if not job_dir.exists():
-        abort(404)
-    return send_from_directory(job_dir, filename, as_attachment=False)
 
 
 if __name__ == "__main__":

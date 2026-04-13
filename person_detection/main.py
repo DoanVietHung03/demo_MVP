@@ -19,8 +19,8 @@ def main() -> None:
     pipeline.process_video(
         source=CONFIG.source,
         output_dir=CONFIG.output_dir,
-        output_video_path=CONFIG.output_video_path,
         frame_skip=CONFIG.frame_skip,
+        crop_save_interval=CONFIG.crop_save_interval,
         max_frames=CONFIG.max_frames,
     )
 

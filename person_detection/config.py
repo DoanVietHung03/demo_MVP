@@ -18,15 +18,15 @@ class PersonInstance:
 @dataclass
 class AppConfig:
     source: str = "./vid_test/vid_1.mp4"
-    model_path: str = "yolo11n.pt"
+    model_path: str = "./weights/yolo11n.pt"
     device: str = "cuda:0"
     output_dir: Optional[str] = "person_detection/output/crops"
-    output_video_path: Optional[str] = "person_detection/output/annotated.mp4"
     confidence_threshold: float = 0.5
     iou_threshold: float = 0.45
     crop_padding: int = 8
     input_resize_scale: float = 0.75
     frame_skip: int = 0
+    crop_save_interval: int = 10
     track_ttl_frames: int = 60
     alert_cooldown_frames: Optional[int] = None
     max_frames: Optional[int] = None
