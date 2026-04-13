@@ -117,6 +117,8 @@ class MainPipeline:
         summary: Dict[str, object] = {
             "source": str(config.source),
             "output_dir": str(paths.crops_dir),
+            "runtime_backend": str(pipeline.runtime_backend_label()),
+            "model_path": config.model_path,
             "track_dir_count": len(track_dirs),
             "crop_file_count": len(crop_files),
         }

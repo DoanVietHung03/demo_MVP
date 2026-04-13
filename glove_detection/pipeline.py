@@ -13,6 +13,7 @@ try:
         GloveClassification,
         classify_glove_image,
         classify_glove_to_json,
+        describe_glove_classifier_backend,
         load_tflite_glove_classifier,
     )
 except ModuleNotFoundError:  # pragma: no cover - convenience for direct script execution
@@ -21,6 +22,7 @@ except ModuleNotFoundError:  # pragma: no cover - convenience for direct script 
         GloveClassification,
         classify_glove_image,
         classify_glove_to_json,
+        describe_glove_classifier_backend,
         load_tflite_glove_classifier,
     )
 
@@ -114,6 +116,11 @@ def process_hands_tree(config: GloveDetectionConfig) -> Dict[str, object]:
     output_root.mkdir(parents=True, exist_ok=True)
 
     classifier = load_tflite_glove_classifier(config)
+    runtime_backend = describe_glove_classifier_backend(classifier)
+    print(
+        "[Stage Runtime] "
+        f"glove_detection: {runtime_backend} | model={config.model_path}"
+    )
     processed_count = 0
     skipped_count = 0
     glove_count = 0
@@ -160,6 +167,8 @@ def process_hands_tree(config: GloveDetectionConfig) -> Dict[str, object]:
         "job_name": job_name,
         "input_root": str(input_root),
         "output_root": str(output_root),
+        "runtime_backend": runtime_backend,
+        "model_path": config.model_path,
         "processed_count": processed_count,
         "skipped_count": skipped_count,
         "glove_count": glove_count,

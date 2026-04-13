@@ -20,6 +20,14 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - convenience for direct script execution
     from config import RegionExtractionConfig
 
+from runtime_support.onnx import (
+    ONNXSessionInfo,
+    format_runtime_backend_label,
+    is_onnx_model_path,
+    load_onnx_session,
+    run_yolo_onnx_pose,
+)
+
 
 @dataclass
 class RegionResult:
@@ -48,6 +56,7 @@ LEFT_WRIST = 9
 RIGHT_WRIST = 10
 LEFT_HIP = 11
 RIGHT_HIP = 12
+YOLO_DEFAULT_IOU_THRESHOLD = 0.7
 
 
 def _clip_box(
@@ -210,12 +219,62 @@ class PersonRegionExtractor:
             raise ValueError("Model path must not be empty.")
 
         self.device = normalized_device
-        self.model = YOLO(normalized_model_path).to(self.device)
+        self.backend = "torch"
+        self.model = None
+        self.onnx_session: Optional[ONNXSessionInfo] = None
+        if is_onnx_model_path(normalized_model_path):
+            self.backend = "onnx"
+            self.onnx_session = load_onnx_session(normalized_model_path, self.device)
+        else:
+            self.model = YOLO(normalized_model_path).to(self.device)
+
+    def runtime_backend_label(self) -> str:
+        return format_runtime_backend_label(
+            self.backend,
+            self.device,
+            self.onnx_session,
+        )
 
     def _predict_pose(
         self,
         image: np.ndarray,
     ) -> Optional[PoseEstimate]:
+        if self.backend == "onnx":
+            if self.onnx_session is None:
+                raise RuntimeError("ONNX pose session is not initialized.")
+            boxes_xyxy, confidence_array, class_id_array, keypoints_array = run_yolo_onnx_pose(
+                self.onnx_session,
+                image,
+                resize_scale=1.0,
+                confidence_threshold=float(self.config.person_confidence_threshold),
+                iou_threshold=YOLO_DEFAULT_IOU_THRESHOLD,
+            )
+            if boxes_xyxy.size == 0:
+                return None
+
+            person_indices = np.where(class_id_array.astype(int) == 0)[0]
+            if person_indices.size == 0:
+                return None
+
+            chosen_index = _select_primary_person_index(
+                person_indices,
+                boxes_xyxy,
+                confidence_array,
+                image.shape,
+            )
+            keypoints_xy = keypoints_array[chosen_index, :, :2]
+            if keypoints_array.shape[2] >= 3:
+                keypoints_conf = keypoints_array[chosen_index, :, 2]
+            else:
+                keypoints_conf = np.ones(keypoints_xy.shape[0], dtype=np.float32)
+            return PoseEstimate(
+                keypoints_xy=keypoints_xy.astype(np.float32),
+                keypoints_conf=keypoints_conf.astype(np.float32),
+            )
+
+        if self.model is None:
+            raise RuntimeError("Pose extraction model is not initialized.")
+
         result = self.model.predict(
             source=image,
             device=self.device,
@@ -469,6 +528,12 @@ def process_crop_tree(config: RegionExtractionConfig) -> Dict[str, object]:
     output_root.mkdir(parents=True, exist_ok=True)
 
     extractor = PersonRegionExtractor(config)
+    runtime_backend = extractor.runtime_backend_label()
+    print(
+        "[Stage Runtime] "
+        f"person_region_extraction: {runtime_backend} | "
+        f"device={extractor.device} | model={config.model_path}"
+    )
     processed_count = 0
     skipped_count = 0
 
@@ -491,6 +556,8 @@ def process_crop_tree(config: RegionExtractionConfig) -> Dict[str, object]:
         "job_name": job_name,
         "input_crops_dir": str(input_crops_dir),
         "output_root": str(output_root),
+        "runtime_backend": runtime_backend,
+        "model_path": config.model_path,
         "processed_count": processed_count,
         "skipped_count": skipped_count,
     }

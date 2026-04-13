@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
@@ -15,15 +15,26 @@ except ImportError as exc:  # pragma: no cover - import error is environment-spe
         "Missing dependency 'ultralytics'. Install it with `pip install ultralytics`."
     ) from exc
 
+from runtime_support.onnx import (
+    ONNXSessionInfo,
+    format_runtime_backend_label,
+    is_onnx_model_path,
+    load_onnx_session,
+    run_yolo_onnx_detections,
+    run_yolo_onnx_pose,
+)
+
 
 @dataclass
 class YOLODetectionInference:
-    model: YOLO
+    model: object
     device: str
     confidence_threshold: float
     iou_threshold: float
     input_resize_scale: float
     class_name_to_id: Dict[str, int]
+    backend: str = "torch"
+    onnx_session: ONNXSessionInfo | None = None
 
 
 @dataclass
@@ -36,11 +47,30 @@ class PosePerson:
 
 @dataclass
 class YOLOPoseInference:
-    model: YOLO
+    model: object
     device: str
     confidence_threshold: float
     iou_threshold: float
     input_resize_scale: float
+    backend: str = "torch"
+    class_names: Dict[int, str] = field(default_factory=dict)
+    onnx_session: ONNXSessionInfo | None = None
+
+
+def describe_detection_inference_backend(inference_engine: YOLODetectionInference) -> str:
+    return format_runtime_backend_label(
+        inference_engine.backend,
+        inference_engine.device,
+        inference_engine.onnx_session,
+    )
+
+
+def describe_pose_inference_backend(inference_engine: YOLOPoseInference) -> str:
+    return format_runtime_backend_label(
+        inference_engine.backend,
+        inference_engine.device,
+        inference_engine.onnx_session,
+    )
 
 
 def validate_device(device: str) -> str:
@@ -57,6 +87,10 @@ def validate_device(device: str) -> str:
 
 def resolve_class_name_to_id(model: YOLO) -> Dict[str, int]:
     names = getattr(model.model, "names", None)
+    return resolve_class_name_to_id_from_names(names)
+
+
+def resolve_class_name_to_id_from_names(names: object) -> Dict[str, int]:
     mapping: Dict[str, int] = {}
     if isinstance(names, dict):
         for class_id, class_name in names.items():
@@ -81,6 +115,19 @@ def load_yolo_detection_inference(
         raise ValueError("Input resize scale must be greater than 0.")
 
     normalized_device = validate_device(device)
+    if is_onnx_model_path(normalized_model_path):
+        session_info = load_onnx_session(normalized_model_path, normalized_device)
+        return YOLODetectionInference(
+            model=session_info.session,
+            device=normalized_device,
+            confidence_threshold=confidence_threshold,
+            iou_threshold=iou_threshold,
+            input_resize_scale=input_resize_scale,
+            class_name_to_id=resolve_class_name_to_id_from_names(session_info.class_names),
+            backend="onnx",
+            onnx_session=session_info,
+        )
+
     model = YOLO(normalized_model_path).to(normalized_device)
     return YOLODetectionInference(
         model=model,
@@ -106,6 +153,19 @@ def load_yolo_pose_inference(
         raise ValueError("Input resize scale must be greater than 0.")
 
     normalized_device = validate_device(device)
+    if is_onnx_model_path(normalized_model_path):
+        session_info = load_onnx_session(normalized_model_path, normalized_device)
+        return YOLOPoseInference(
+            model=session_info.session,
+            device=normalized_device,
+            confidence_threshold=confidence_threshold,
+            iou_threshold=iou_threshold,
+            input_resize_scale=input_resize_scale,
+            backend="onnx",
+            class_names=dict(session_info.class_names),
+            onnx_session=session_info,
+        )
+
     model = YOLO(normalized_model_path).to(normalized_device)
     return YOLOPoseInference(
         model=model,
@@ -113,6 +173,17 @@ def load_yolo_pose_inference(
         confidence_threshold=confidence_threshold,
         iou_threshold=iou_threshold,
         input_resize_scale=input_resize_scale,
+        class_names={
+            class_id: class_name
+            for class_id, class_name in (
+                getattr(model.model, "names", {}) or {}
+            ).items()
+        }
+        if isinstance(getattr(model.model, "names", None), dict)
+        else {
+            class_id: str(class_name)
+            for class_id, class_name in enumerate(getattr(model.model, "names", []) or [])
+        },
     )
 
 
@@ -147,6 +218,22 @@ def infer_detections(
     inference_engine: YOLODetectionInference,
     frame: np.ndarray,
 ) -> sv.Detections:
+    if inference_engine.backend == "onnx":
+        if inference_engine.onnx_session is None:
+            raise RuntimeError("ONNX detection inference session is not initialized.")
+        xyxy, confidence, class_id = run_yolo_onnx_detections(
+            inference_engine.onnx_session,
+            frame,
+            resize_scale=float(inference_engine.input_resize_scale),
+            confidence_threshold=float(inference_engine.confidence_threshold),
+            iou_threshold=float(inference_engine.iou_threshold),
+        )
+        return sv.Detections(
+            xyxy=xyxy,
+            confidence=confidence,
+            class_id=class_id,
+        )
+
     inference_frame, resize_scale = _resize_frame_for_inference(
         frame,
         float(inference_engine.input_resize_scale),
@@ -200,6 +287,34 @@ def infer_pose_people(
     inference_engine: YOLOPoseInference,
     frame: np.ndarray,
 ) -> List[PosePerson]:
+    if inference_engine.backend == "onnx":
+        if inference_engine.onnx_session is None:
+            raise RuntimeError("ONNX pose inference session is not initialized.")
+        xyxy, confidence, class_id, keypoints = run_yolo_onnx_pose(
+            inference_engine.onnx_session,
+            frame,
+            resize_scale=float(inference_engine.input_resize_scale),
+            confidence_threshold=float(inference_engine.confidence_threshold),
+            iou_threshold=float(inference_engine.iou_threshold),
+        )
+        pose_people: List[PosePerson] = []
+        for index, bbox_xyxy in enumerate(xyxy):
+            if class_id.size > index and int(class_id[index]) != 0:
+                continue
+            pose_people.append(
+                PosePerson(
+                    bbox_xyxy=tuple(int(value) for value in bbox_xyxy.astype(int)),
+                    confidence=float(confidence[index]) if confidence.size > index else 0.0,
+                    keypoints_xy=keypoints[index, :, :2].astype(np.float32),
+                    keypoints_conf=(
+                        keypoints[index, :, 2].astype(np.float32)
+                        if keypoints.shape[2] >= 3
+                        else np.ones(keypoints.shape[1], dtype=np.float32)
+                    ),
+                )
+            )
+        return pose_people
+
     inference_frame, resize_scale = _resize_frame_for_inference(
         frame,
         float(inference_engine.input_resize_scale),

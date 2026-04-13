@@ -76,6 +76,18 @@ Main pipeline:
 venv/bin/python main_pipeline/main.py
 ```
 
+Export ONNX cho các model PyTorch trong repo:
+
+```bash
+venv/bin/python export_onnx.py
+```
+
+Script này sẽ export:
+- `weights/yolo11n.pt -> weights/yolo11n.onnx`
+- `weights/yolo11n-pose.pt -> weights/yolo11n-pose.onnx`
+- `weights/smoke.pt -> weights/smoke.onnx`
+- `weights/facemask.pth -> weights/facemask.onnx`
+
 ## Ghi chú cấu hình
 
 - `person_region_extraction.config.process_latest_job`
@@ -91,9 +103,15 @@ venv/bin/python main_pipeline/main.py
   - gom cấu hình các stage vào một chỗ
   - cho phép bật/tắt từng stage khi chạy batch
 - Mặc định nhiều config đang để `device="cuda:0"`. Nếu máy không có CUDA, đổi sang `cpu`.
+- `person_detection`, `person_region_extraction`, `behavior_detection`, `facemask_detection`
+  - nếu `model_path` trỏ tới file `.onnx`, code sẽ chạy qua ONNX Runtime
+  - nếu `model_path` trỏ tới `.pt`/`.pth`, code sẽ giữ backend PyTorch/Ultralytics cũ
+  - với `device="cuda:0"`, helper ONNX Runtime sẽ tự preload CUDA/cuDNN libs từ `venv` trước khi tạo session
 - `glove_detection` cần thêm runtime TFLite để chạy thật:
   - cài `tflite-runtime`
   - hoặc cài `tensorflow`
+- `glove_detection` hiện vẫn là nhánh TFLite/CPU riêng, chưa được chuyển sang ONNX trong repo này.
+- Nếu muốn ONNX Runtime chạy bằng GPU thật, môi trường phải có đủ CUDA/cuDNN runtime mà `onnxruntime-gpu` yêu cầu. Nếu thiếu, ONNX Runtime sẽ fallback về CPU và cảnh báo rõ provider.
 
 ## Chạy kiểm tra nhanh
 

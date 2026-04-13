@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any, Dict, Tuple
 
 import cv2
 import numpy as np
@@ -14,15 +15,34 @@ except ImportError as exc:  # pragma: no cover - import error is environment-spe
         "Missing dependency 'ultralytics'. Install it with `pip install ultralytics`."
     ) from exc
 
+from runtime_support.onnx import (
+    ONNXSessionInfo,
+    format_runtime_backend_label,
+    is_onnx_model_path,
+    load_onnx_session,
+    run_yolo_onnx_detections,
+)
+
 
 @dataclass
 class YOLOPersonInference:
-    model: YOLO
+    model: Any
     device: str
     confidence_threshold: float
     iou_threshold: float
     person_class_id: int
     input_resize_scale: float
+    backend: str = "torch"
+    class_names: Dict[int, str] = field(default_factory=dict)
+    onnx_session: ONNXSessionInfo | None = None
+
+
+def describe_person_inference_backend(inference_engine: YOLOPersonInference) -> str:
+    return format_runtime_backend_label(
+        inference_engine.backend,
+        inference_engine.device,
+        inference_engine.onnx_session,
+    )
 
 
 def validate_device(device: str) -> str:
@@ -39,6 +59,10 @@ def validate_device(device: str) -> str:
 
 def resolve_person_class_id(model: YOLO) -> int:
     names = getattr(model.model, "names", None)
+    return resolve_person_class_id_from_names(names)
+
+
+def resolve_person_class_id_from_names(names: Any) -> int:
     if isinstance(names, dict):
         for class_id, class_name in names.items():
             if str(class_name).lower() == "person":
@@ -64,6 +88,21 @@ def load_yolo_person_inference(
         raise ValueError("Input resize scale must be greater than 0.")
 
     normalized_device = validate_device(device)
+    if is_onnx_model_path(normalized_model_path):
+        session_info = load_onnx_session(normalized_model_path, normalized_device)
+        class_names = dict(session_info.class_names)
+        return YOLOPersonInference(
+            model=session_info.session,
+            device=normalized_device,
+            confidence_threshold=confidence_threshold,
+            iou_threshold=iou_threshold,
+            person_class_id=resolve_person_class_id_from_names(class_names),
+            input_resize_scale=input_resize_scale,
+            backend="onnx",
+            class_names=class_names,
+            onnx_session=session_info,
+        )
+
     model = YOLO(normalized_model_path).to(normalized_device)
     return YOLOPersonInference(
         model=model,
@@ -72,6 +111,17 @@ def load_yolo_person_inference(
         iou_threshold=iou_threshold,
         person_class_id=resolve_person_class_id(model),
         input_resize_scale=input_resize_scale,
+        class_names={
+            class_id: class_name
+            for class_id, class_name in (
+                getattr(model.model, "names", {}) or {}
+            ).items()
+        }
+        if isinstance(getattr(model.model, "names", None), dict)
+        else {
+            class_id: str(class_name)
+            for class_id, class_name in enumerate(getattr(model.model, "names", []) or [])
+        },
     )
 
 
@@ -79,6 +129,27 @@ def infer_person_detections(
     inference_engine: YOLOPersonInference,
     frame: np.ndarray,
 ) -> sv.Detections:
+    if inference_engine.backend == "onnx":
+        if inference_engine.onnx_session is None:
+            raise RuntimeError("ONNX person inference session is not initialized.")
+        xyxy, confidence, class_id = run_yolo_onnx_detections(
+            inference_engine.onnx_session,
+            frame,
+            resize_scale=float(inference_engine.input_resize_scale),
+            confidence_threshold=float(inference_engine.confidence_threshold),
+            iou_threshold=float(inference_engine.iou_threshold),
+        )
+        detections = sv.Detections(
+            xyxy=xyxy,
+            confidence=confidence,
+            class_id=class_id,
+        )
+        if len(detections) == 0 or detections.class_id is None:
+            return detections
+
+        person_mask = detections.class_id == inference_engine.person_class_id
+        return detections[person_mask]
+
     inference_frame = frame
     resize_scale = float(inference_engine.input_resize_scale)
     if resize_scale != 1.0:

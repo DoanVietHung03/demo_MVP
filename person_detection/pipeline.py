@@ -10,7 +10,12 @@ import numpy as np
 import supervision as sv
 
 from person_detection.config import PersonInstance
-from person_detection.inference import YOLOPersonInference, infer_person_detections, load_yolo_person_inference
+from person_detection.inference import (
+    YOLOPersonInference,
+    describe_person_inference_backend,
+    infer_person_detections,
+    load_yolo_person_inference,
+)
 
 
 log_queue: "queue.Queue[Tuple[str, str, Optional[np.ndarray], Optional[str]]]" = queue.Queue(maxsize=4096)
@@ -151,6 +156,9 @@ class PersonDetectionPipeline:
         self.box_annotator = sv.BoxAnnotator(thickness=2)
         self.label_annotator = sv.LabelAnnotator(text_position=sv.Position.TOP_LEFT)
 
+    def runtime_backend_label(self) -> str:
+        return describe_person_inference_backend(self.inference_engine)
+
     def _clip_bbox(
         self,
         xyxy: np.ndarray,
@@ -254,6 +262,11 @@ class PersonDetectionPipeline:
             Callable[[int, Optional[int], np.ndarray, List[PersonInstance]], None]
         ] = None,
     ) -> None:
+        print(
+            "[Stage Runtime] "
+            f"person_detection: {self.runtime_backend_label()} | "
+            f"device={self.device} | model={self.model_path}"
+        )
         cap = cv2.VideoCapture(source)
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open video source: {source}")

@@ -10,7 +10,7 @@ class FaceMaskConfig:
     input_head_face_dir: Optional[str] = None
     output_root: str = "facemask_detection/output"
     process_latest_job: bool = True
-    model_path: str = "./weights/facemask.pth"
+    model_path: str = "./weights/facemask.onnx"
     device: str = "cpu"
     input_size: int = 360
     confidence_threshold: float = 0.5

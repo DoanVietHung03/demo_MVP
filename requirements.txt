@@ -3,3 +3,5 @@ numpy>=1.26,<3
 opencv-python>=4.10,<5
 supervision>=0.27,<0.28
 ultralytics>=8.4,<9
+onnx>=1.21,<2
+onnxruntime-gpu>=1.24,<2

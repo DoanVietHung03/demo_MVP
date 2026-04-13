@@ -6,7 +6,7 @@ import types
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import cv2
 import numpy as np
@@ -18,6 +18,9 @@ try:
     from facemask_detection.config import FaceMaskConfig
 except ModuleNotFoundError:  # pragma: no cover - convenience for direct script execution
     from config import FaceMaskConfig
+
+from runtime_support.onnx import ONNXSessionInfo, is_onnx_model_path, load_onnx_session
+from runtime_support.onnx import format_runtime_backend_label
 
 
 ID_TO_CLASS = {0: "Mask", 1: "NoMask"}
@@ -38,12 +41,22 @@ class FaceMaskDetection:
 
 @dataclass
 class FaceMaskInferenceEngine:
-    model: nn.Module
+    model: Any
     device: str
     input_size: int
     confidence_threshold: float
     iou_threshold: float
     anchors: np.ndarray
+    backend: str = "torch"
+    onnx_session: ONNXSessionInfo | None = None
+
+
+def describe_facemask_inference_backend(engine: FaceMaskInferenceEngine) -> str:
+    return format_runtime_backend_label(
+        engine.backend,
+        engine.device,
+        engine.onnx_session,
+    )
 
 
 def validate_device(device: str) -> str:
@@ -257,6 +270,19 @@ def load_facemask_inference_engine(config: FaceMaskConfig) -> FaceMaskInferenceE
         raise FileNotFoundError(f"Facemask model not found: {model_path}")
 
     device = validate_device(config.device)
+    if is_onnx_model_path(model_path):
+        session_info = load_onnx_session(model_path, device)
+        return FaceMaskInferenceEngine(
+            model=session_info.session,
+            device=device,
+            input_size=config.input_size,
+            confidence_threshold=config.confidence_threshold,
+            iou_threshold=config.iou_threshold,
+            anchors=generate_anchors(),
+            backend="onnx",
+            onnx_session=session_info,
+        )
+
     _register_legacy_module()
     with warnings.catch_warnings():
         warnings.filterwarnings(
@@ -298,12 +324,23 @@ def run_facemask_inference(
     normalized_image = resized_image.astype(np.float32) / 255.0
     nchw_image = np.transpose(normalized_image[None, ...], (0, 3, 1, 2))
 
-    with torch.no_grad():
-        input_tensor = torch.from_numpy(nchw_image).to(engine.device)
-        raw_bboxes_tensor, raw_classes_tensor = engine.model(input_tensor)
+    if engine.backend == "onnx":
+        if engine.onnx_session is None:
+            raise RuntimeError("ONNX facemask inference session is not initialized.")
+        raw_bboxes, raw_classes = engine.onnx_session.session.run(
+            list(engine.onnx_session.output_names),
+            {engine.onnx_session.input_name: np.ascontiguousarray(nchw_image)},
+        )
+        raw_bboxes = raw_bboxes[0]
+        raw_classes = raw_classes[0]
+    else:
+        with torch.no_grad():
+            input_tensor = torch.from_numpy(nchw_image).to(engine.device)
+            raw_bboxes_tensor, raw_classes_tensor = engine.model(input_tensor)
 
-    raw_bboxes = raw_bboxes_tensor.detach().cpu().numpy()[0]
-    raw_classes = raw_classes_tensor.detach().cpu().numpy()[0]
+        raw_bboxes = raw_bboxes_tensor.detach().cpu().numpy()[0]
+        raw_classes = raw_classes_tensor.detach().cpu().numpy()[0]
+
     if raw_bboxes.shape[0] != engine.anchors.shape[0]:
         raise ValueError(
             "Anchor count does not match model output. "

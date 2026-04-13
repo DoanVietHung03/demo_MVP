@@ -11,6 +11,7 @@ try:
     from facemask_detection.config import FaceMaskConfig
     from facemask_detection.inference import (
         FaceMaskDetection,
+        describe_facemask_inference_backend,
         detections_to_json,
         load_facemask_inference_engine,
         run_facemask_inference,
@@ -19,6 +20,7 @@ except ModuleNotFoundError:  # pragma: no cover - convenience for direct script 
     from config import FaceMaskConfig
     from inference import (
         FaceMaskDetection,
+        describe_facemask_inference_backend,
         detections_to_json,
         load_facemask_inference_engine,
         run_facemask_inference,
@@ -96,6 +98,12 @@ def process_head_face_tree(config: FaceMaskConfig) -> Dict[str, object]:
     output_root.mkdir(parents=True, exist_ok=True)
 
     engine = load_facemask_inference_engine(config)
+    runtime_backend = describe_facemask_inference_backend(engine)
+    print(
+        "[Stage Runtime] "
+        f"facemask_detection: {runtime_backend} | "
+        f"device={engine.device} | model={config.model_path}"
+    )
     processed_count = 0
     skipped_count = 0
     mask_count = 0
@@ -139,6 +147,8 @@ def process_head_face_tree(config: FaceMaskConfig) -> Dict[str, object]:
         "job_name": job_name,
         "input_root": str(input_root),
         "output_root": str(output_root),
+        "runtime_backend": runtime_backend,
+        "model_path": config.model_path,
         "processed_count": processed_count,
         "skipped_count": skipped_count,
         "mask_count": mask_count,

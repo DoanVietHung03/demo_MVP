@@ -7,9 +7,9 @@ from typing import Optional
 @dataclass
 class BehaviorDetectionConfig:
     source: str = "./vid_test/vid_1.mp4"
-    person_phone_model_path: str = "./weights/yolo11n.pt"
-    pose_model_path: str = "./weights/yolo11n-pose.pt"
-    smoke_model_path: str = "./weights/smoke.pt"
+    person_phone_model_path: str = "./weights/yolo11n.onnx"
+    pose_model_path: str = "./weights/yolo11n-pose.onnx"
+    smoke_model_path: str = "./weights/smoke.onnx"
     device: str = "cuda:0"
     output_root: str = "behavior_detection/output/default_run"
     person_confidence_threshold: float = 0.35

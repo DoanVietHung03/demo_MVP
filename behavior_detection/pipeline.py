@@ -15,6 +15,8 @@ try:
         PosePerson,
         YOLODetectionInference,
         YOLOPoseInference,
+        describe_detection_inference_backend,
+        describe_pose_inference_backend,
         filter_detections_by_class_names,
         infer_detections,
         infer_filtered_detections,
@@ -28,6 +30,8 @@ except ModuleNotFoundError:  # pragma: no cover - convenience for direct script 
         PosePerson,
         YOLODetectionInference,
         YOLOPoseInference,
+        describe_detection_inference_backend,
+        describe_pose_inference_backend,
         filter_detections_by_class_names,
         infer_detections,
         infer_filtered_detections,
@@ -268,6 +272,13 @@ class BehaviorDetectionPipeline:
         self.track_states: Dict[int, TrackBehaviorState] = {}
         self.box_annotator = sv.BoxAnnotator(thickness=2)
         self.label_annotator = sv.LabelAnnotator(text_position=sv.Position.TOP_LEFT)
+
+    def runtime_backend_summary(self) -> Dict[str, str]:
+        return {
+            "person_phone": describe_detection_inference_backend(self.person_phone_engine),
+            "pose": describe_pose_inference_backend(self.pose_engine),
+            "smoke": describe_detection_inference_backend(self.smoke_engine),
+        }
 
     def _should_emit_event(
         self,
@@ -564,6 +575,15 @@ class BehaviorDetectionPipeline:
             Callable[[int, Optional[int], np.ndarray, List[TrackedPersonBehavior], List[BehaviorEvent]], None]
         ] = None,
     ) -> Dict[str, object]:
+        runtime_backends = self.runtime_backend_summary()
+        print(
+            "[Stage Runtime] "
+            "behavior_detection: "
+            f"shared={runtime_backends['person_phone']} | "
+            f"pose={runtime_backends['pose']} | "
+            f"smoke={runtime_backends['smoke']} | "
+            f"device={self.config.device}"
+        )
         cap = cv2.VideoCapture(source)
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open video source: {source}")
@@ -622,6 +642,12 @@ class BehaviorDetectionPipeline:
             "source": str(source),
             "output_root": str(destination_root),
             "events_path": str(events_path),
+            "runtime_backends": runtime_backends,
+            "model_paths": {
+                "person_phone": self.config.person_phone_model_path,
+                "pose": self.config.pose_model_path,
+                "smoke": self.config.smoke_model_path,
+            },
             "processed_frames": processed_frames,
             "emitted_events": emitted_events,
         }

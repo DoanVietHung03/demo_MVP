@@ -13,6 +13,8 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - convenience for direct script execution
     from config import GloveDetectionConfig
 
+from runtime_support.onnx import format_runtime_backend_label
+
 
 def _resolve_tflite_interpreter_class() -> Optional[type]:
     try:
@@ -57,6 +59,10 @@ class TFLiteGloveClassifier:
     normalize_to_unit: bool
     input_mean: float
     input_std: float
+
+
+def describe_glove_classifier_backend(classifier: TFLiteGloveClassifier) -> str:
+    return format_runtime_backend_label("tflite", "cpu")
 
 
 def load_labels(labels_path: str) -> List[str]:
