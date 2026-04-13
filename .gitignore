@@ -15,6 +15,7 @@ weights/
 logs/
 person_region_extraction/output/
 facemask_detection/output/
+glove_detection/output/
 behavior_detection/output/
 web_output/
 output/

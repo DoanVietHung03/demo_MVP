@@ -1,11 +1,12 @@
 # Demo MVP
 
-Pipeline thị giác máy tính gồm 4 stage chính:
+Pipeline thị giác máy tính gồm 5 stage chính:
 
 1. `person_detection`: detect + track người và lưu crop theo `track_id`
 2. `person_region_extraction`: tách `head_face`, `hands`, `torso` từ crop người
 3. `facemask_detection`: detect `Mask` / `NoMask` trên `head_face`
-4. `behavior_detection`: detect các hành vi như dùng điện thoại / hút thuốc trên video
+4. `glove_detection`: classify `Glove` / `NoGlove` trên `hands`
+5. `behavior_detection`: detect các hành vi như dùng điện thoại / hút thuốc trên video
 
 ## Yêu cầu
 
@@ -49,6 +50,12 @@ Behavior detection:
 venv/bin/python behavior_detection/main.py
 ```
 
+Glove detection:
+
+```bash
+venv/bin/python glove_detection/main.py
+```
+
 Web demo:
 
 ```bash
@@ -63,11 +70,17 @@ venv/bin/python run.py
 - `facemask_detection.config.process_latest_job`
   - `True`: tự lấy job region extraction mới nhất trong `results_root`
   - `False`: bắt buộc truyền `input_head_face_dir`
+- `glove_detection.config.process_latest_job`
+  - `True`: tự lấy job region extraction mới nhất trong `results_root`
+  - `False`: bắt buộc truyền `input_hands_dir`
 - Mặc định nhiều config đang để `device="cuda:0"`. Nếu máy không có CUDA, đổi sang `cpu`.
+- `glove_detection` cần thêm runtime TFLite để chạy thật:
+  - cài `tflite-runtime`
+  - hoặc cài `tensorflow`
 
 ## Chạy kiểm tra nhanh
 
 ```bash
-venv/bin/python -m compileall person_detection person_region_extraction facemask_detection behavior_detection run.py
+venv/bin/python -m compileall person_detection person_region_extraction facemask_detection glove_detection behavior_detection run.py
 venv/bin/python -m unittest discover -s tests -v
 ```
