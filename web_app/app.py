@@ -185,6 +185,7 @@ def _defaults() -> Dict[str, object]:
         "run_facemask_detection": STREAM_PIPELINE_CONFIG.run_facemask_detection,
         "run_glove_detection": STREAM_PIPELINE_CONFIG.run_glove_detection,
         "run_behavior_detection": STREAM_PIPELINE_CONFIG.run_behavior_detection,
+        "save_artifacts": STREAM_PIPELINE_CONFIG.save_artifacts,
     }
 
 
@@ -215,6 +216,7 @@ def _defaults_from_form(form) -> Dict[str, object]:
     defaults["run_facemask_detection"] = _parse_checkbox(form.get("run_facemask_detection"))
     defaults["run_glove_detection"] = _parse_checkbox(form.get("run_glove_detection"))
     defaults["run_behavior_detection"] = _parse_checkbox(form.get("run_behavior_detection"))
+    defaults["save_artifacts"] = _parse_checkbox(form.get("save_artifacts"))
     return defaults
 
 
@@ -467,6 +469,7 @@ def _build_stream_pipeline_config(
     config.run_facemask_detection = bool(job.get("run_facemask_detection"))
     config.run_glove_detection = bool(job.get("run_glove_detection"))
     config.run_behavior_detection = bool(job.get("run_behavior_detection"))
+    config.save_artifacts = bool(job.get("save_artifacts", config.save_artifacts))
 
     person_config = replace(config.person_detection)
     person_config.source = str(job["source"])
@@ -616,6 +619,7 @@ def start_job():
         "run_facemask_detection": stage_flags["run_facemask_detection"],
         "run_glove_detection": stage_flags["run_glove_detection"],
         "run_behavior_detection": stage_flags["run_behavior_detection"],
+        "save_artifacts": _parse_checkbox(request.form.get("save_artifacts")),
         "source_is_upload": is_uploaded_source,
         "uploaded_source_path": str(video_source) if is_uploaded_source else None,
         "status": "ready",

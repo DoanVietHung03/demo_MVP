@@ -30,6 +30,10 @@ class StreamPipelineConfig:
     run_behavior_detection: bool = False
     attribute_refresh_interval_frames: int = 6
     summary_flush_interval_frames: int = 15
+    save_artifacts: bool = True
+    use_latest_frame_reader_for_streams: bool = True
+    capture_buffer_size: Optional[int] = 1
+    capture_poll_timeout_seconds: float = 0.2
     person_detection: AppConfig = field(
         default_factory=lambda: replace(PERSON_CONFIG)
     )

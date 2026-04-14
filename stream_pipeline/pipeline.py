@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,7 +24,6 @@ from facemask_detection.pipeline import annotate_image as annotate_facemask_imag
 from glove_detection.inference import (
     GloveClassification,
     classify_glove_image,
-    classify_glove_to_json,
     describe_glove_classifier_backend,
     load_tflite_glove_classifier,
 )
@@ -100,6 +100,137 @@ def build_pipeline_paths(
         behavior_output_root=run_root / "behavior_detection",
         summary_path=run_root / "summary.json",
     )
+
+
+def _looks_like_stream_source(source: Union[str, Path, int]) -> bool:
+    return isinstance(source, str) and "://" in source
+
+
+def _configure_capture_buffer(
+    cap: cv2.VideoCapture,
+    buffer_size: Optional[int],
+) -> None:
+    if buffer_size is None or not hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+        return
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, int(buffer_size))
+    except Exception:
+        return
+
+
+class DirectFrameReader:
+    def __init__(
+        self,
+        source: Union[str, Path, int],
+        buffer_size: Optional[int] = None,
+    ) -> None:
+        self.cap = cv2.VideoCapture(source)
+        _configure_capture_buffer(self.cap, buffer_size)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Cannot open video source: {source}")
+        total_frames_raw = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.total_frames = total_frames_raw if total_frames_raw > 0 else None
+        self._frame_index = -1
+
+    def read_next(
+        self,
+        timeout_seconds: float = 0.0,
+    ) -> Tuple[str, Optional[int], Optional[np.ndarray]]:
+        _ = timeout_seconds
+        ok, frame = self.cap.read()
+        if not ok:
+            return "eof", None, None
+        self._frame_index += 1
+        return "frame", self._frame_index, frame
+
+    def close(self) -> None:
+        self.cap.release()
+
+
+class LatestFrameReader:
+    def __init__(
+        self,
+        source: Union[str, Path, int],
+        buffer_size: Optional[int] = 1,
+    ) -> None:
+        self.cap = cv2.VideoCapture(source)
+        _configure_capture_buffer(self.cap, buffer_size)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Cannot open video source: {source}")
+        total_frames_raw = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.total_frames = total_frames_raw if total_frames_raw > 0 else None
+
+        self._condition = threading.Condition()
+        self._latest_frame: Optional[np.ndarray] = None
+        self._latest_frame_index = -1
+        self._last_delivered_index = -1
+        self._finished = False
+        self._stop_requested = False
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop,
+            daemon=True,
+        )
+        self._reader_thread.start()
+
+    def _reader_loop(self) -> None:
+        frame_index = -1
+        try:
+            while True:
+                with self._condition:
+                    if self._stop_requested:
+                        self._finished = True
+                        self._condition.notify_all()
+                        return
+
+                ok, frame = self.cap.read()
+                if not ok:
+                    with self._condition:
+                        self._finished = True
+                        self._condition.notify_all()
+                    return
+
+                frame_index += 1
+                with self._condition:
+                    self._latest_frame = frame
+                    self._latest_frame_index = frame_index
+                    self._condition.notify_all()
+        finally:
+            self.cap.release()
+
+    def read_next(
+        self,
+        timeout_seconds: float = 0.2,
+    ) -> Tuple[str, Optional[int], Optional[np.ndarray]]:
+        deadline = time.time() + max(0.0, float(timeout_seconds))
+        with self._condition:
+            while True:
+                if (
+                    self._latest_frame is not None
+                    and self._latest_frame_index > self._last_delivered_index
+                ):
+                    self._last_delivered_index = self._latest_frame_index
+                    return (
+                        "frame",
+                        self._latest_frame_index,
+                        self._latest_frame.copy(),
+                    )
+                if self._finished:
+                    return "eof", None, None
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return "timeout", None, None
+                self._condition.wait(timeout=remaining)
+
+    def close(self) -> None:
+        with self._condition:
+            self._stop_requested = True
+            self._condition.notify_all()
+        try:
+            self.cap.release()
+        except Exception:
+            pass
+        if self._reader_thread.is_alive():
+            self._reader_thread.join(timeout=1.0)
 
 
 def _draw_text_chip(
@@ -387,6 +518,12 @@ class StreamPipeline:
             1,
             int(self.config.person_detection.crop_save_interval),
         )
+        save_artifacts = bool(self.config.save_artifacts)
+        use_latest_frame_reader = bool(
+            self.config.use_latest_frame_reader_for_streams
+            and _looks_like_stream_source(self.config.source)
+        )
+        capture_mode = "latest-frame-thread" if use_latest_frame_reader else "direct"
 
         person_pipeline: Optional[PersonDetectionPipeline] = None
         ppe_pipeline: Optional[PPEDetectionPipeline] = None
@@ -407,7 +544,7 @@ class StreamPipeline:
         track_last_seen: Dict[int, int] = {}
         seen_track_ids: set[int] = set()
 
-        cap = None
+        frame_reader: Optional[Union[DirectFrameReader, LatestFrameReader]] = None
         ppe_detections_file = None
         behavior_events_file = None
         try:
@@ -427,6 +564,8 @@ class StreamPipeline:
                     "output_dir": str(paths.crops_dir),
                     "runtime_backend": person_pipeline.runtime_backend_label(),
                     "model_path": self.config.person_detection.model_path,
+                    "capture_mode": capture_mode,
+                    "save_artifacts": save_artifacts,
                     "processed_frames": 0,
                     "crop_file_count": 0,
                     "track_dir_count": 0,
@@ -463,7 +602,8 @@ class StreamPipeline:
                 )
 
             if self.config.run_ppe_detection:
-                paths.ppe_output_root.mkdir(parents=True, exist_ok=True)
+                if save_artifacts:
+                    paths.ppe_output_root.mkdir(parents=True, exist_ok=True)
                 ppe_pipeline = PPEDetectionPipeline(self.config.ppe_detection)
                 ppe_summary = {
                     "source": str(self.config.source),
@@ -471,6 +611,8 @@ class StreamPipeline:
                     "detections_path": str(paths.ppe_output_root / "detections.jsonl"),
                     "runtime_backend": ppe_pipeline.runtime_backend_label(),
                     "model_path": self.config.ppe_detection.model_path,
+                    "capture_mode": capture_mode,
+                    "save_artifacts": save_artifacts,
                     "processed_frames": 0,
                     "emitted_detections": 0,
                     "class_counts": {
@@ -497,9 +639,10 @@ class StreamPipeline:
                     summary.stages["ppe_detection"],
                 )
                 started_stage_names.append("ppe_detection")
-                ppe_detections_file = (
-                    paths.ppe_output_root / "detections.jsonl"
-                ).open("w", encoding="utf-8")
+                if save_artifacts:
+                    ppe_detections_file = (
+                        paths.ppe_output_root / "detections.jsonl"
+                    ).open("w", encoding="utf-8")
             else:
                 summary.stages["ppe_detection"] = StageRunResult(
                     name="ppe_detection",
@@ -513,12 +656,15 @@ class StreamPipeline:
 
             if self.config.run_region_extraction:
                 region_extractor = PersonRegionExtractor(self.config.person_region_extraction)
-                paths.region_output_root.mkdir(parents=True, exist_ok=True)
+                if save_artifacts:
+                    paths.region_output_root.mkdir(parents=True, exist_ok=True)
                 region_summary = {
                     "input_stream": str(self.config.source),
                     "output_root": str(paths.region_output_root),
                     "runtime_backend": region_extractor.runtime_backend_label(),
                     "model_path": self.config.person_region_extraction.model_path,
+                    "capture_mode": capture_mode,
+                    "save_artifacts": save_artifacts,
                     "processed_count": 0,
                     "saved_count": 0,
                     "attribute_refresh_interval_frames": attribute_refresh_interval,
@@ -554,7 +700,8 @@ class StreamPipeline:
                 )
 
             if self.config.run_facemask_detection:
-                paths.facemask_output_root.mkdir(parents=True, exist_ok=True)
+                if save_artifacts:
+                    paths.facemask_output_root.mkdir(parents=True, exist_ok=True)
                 facemask_engine = load_facemask_inference_engine(
                     self.config.facemask_detection
                 )
@@ -565,6 +712,8 @@ class StreamPipeline:
                         facemask_engine
                     ),
                     "model_path": self.config.facemask_detection.model_path,
+                    "capture_mode": capture_mode,
+                    "save_artifacts": save_artifacts,
                     "processed_count": 0,
                     "mask_count": 0,
                     "no_mask_count": 0,
@@ -602,7 +751,8 @@ class StreamPipeline:
                 )
 
             if self.config.run_glove_detection:
-                paths.glove_output_root.mkdir(parents=True, exist_ok=True)
+                if save_artifacts:
+                    paths.glove_output_root.mkdir(parents=True, exist_ok=True)
                 glove_classifier = load_tflite_glove_classifier(
                     self.config.glove_detection
                 )
@@ -613,6 +763,8 @@ class StreamPipeline:
                         glove_classifier
                     ),
                     "model_path": self.config.glove_detection.model_path,
+                    "capture_mode": capture_mode,
+                    "save_artifacts": save_artifacts,
                     "processed_count": 0,
                     "glove_count": 0,
                     "no_glove_count": 0,
@@ -649,13 +801,16 @@ class StreamPipeline:
                 )
 
             if self.config.run_behavior_detection:
-                paths.behavior_output_root.mkdir(parents=True, exist_ok=True)
+                if save_artifacts:
+                    paths.behavior_output_root.mkdir(parents=True, exist_ok=True)
                 behavior_pipeline = BehaviorDetectionPipeline(self.config.behavior_detection)
                 behavior_summary = {
                     "source": str(self.config.source),
                     "output_root": str(paths.behavior_output_root),
                     "events_path": str(paths.behavior_output_root / "events.jsonl"),
                     "runtime_backends": behavior_pipeline.runtime_backend_summary(),
+                    "capture_mode": capture_mode,
+                    "save_artifacts": save_artifacts,
                     "model_paths": {
                         "person_phone": self.config.behavior_detection.person_phone_model_path,
                         "pose": self.config.behavior_detection.pose_model_path,
@@ -685,9 +840,10 @@ class StreamPipeline:
                     summary.stages["behavior_detection"],
                 )
                 started_stage_names.append("behavior_detection")
-                behavior_events_file = (
-                    paths.behavior_output_root / "events.jsonl"
-                ).open("w", encoding="utf-8")
+                if save_artifacts:
+                    behavior_events_file = (
+                        paths.behavior_output_root / "events.jsonl"
+                    ).open("w", encoding="utf-8")
             else:
                 summary.stages["behavior_detection"] = StageRunResult(
                     name="behavior_detection",
@@ -712,25 +868,36 @@ class StreamPipeline:
                 primary_frame_skip = int(self.config.behavior_detection.frame_skip)
                 primary_max_frames = self.config.behavior_detection.max_frames
 
-            cap = cv2.VideoCapture(self.config.source)
-            if not cap.isOpened():
-                raise RuntimeError(f"Cannot open video source: {self.config.source}")
+            if use_latest_frame_reader:
+                frame_reader = LatestFrameReader(
+                    self.config.source,
+                    buffer_size=self.config.capture_buffer_size,
+                )
+            else:
+                frame_reader = DirectFrameReader(
+                    self.config.source,
+                    buffer_size=self.config.capture_buffer_size,
+                )
 
-            total_frames_raw = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            total_frames = total_frames_raw if total_frames_raw > 0 else None
-            frame_index = 0
+            total_frames = frame_reader.total_frames
 
             while True:
                 self._wait_while_paused()
                 if self._cancel_requested():
                     raise StreamPipelineCancelled("Job cancelled by user.")
-                ok, frame = cap.read()
-                if not ok:
+                read_status, frame_index_raw, frame = frame_reader.read_next(
+                    timeout_seconds=float(self.config.capture_poll_timeout_seconds),
+                )
+                if read_status == "timeout":
+                    continue
+                if read_status == "eof":
                     break
+                if frame_index_raw is None or frame is None:
+                    continue
+                frame_index = int(frame_index_raw)
                 if primary_max_frames is not None and frame_index >= primary_max_frames:
                     break
                 if primary_frame_skip > 0 and frame_index % (primary_frame_skip + 1) != 0:
-                    frame_index += 1
                     continue
 
                 annotated_frame = frame.copy()
@@ -745,7 +912,7 @@ class StreamPipeline:
                     for person in persons:
                         seen_track_ids.add(int(person.tracker_id))
                         track_last_seen[int(person.tracker_id)] = frame_index
-                        if frame_index % crop_save_interval == 0:
+                        if save_artifacts and frame_index % crop_save_interval == 0:
                             crop_path = (
                                 paths.crops_dir
                                 / f"track_{person.tracker_id}"
@@ -777,6 +944,7 @@ class StreamPipeline:
                             region_summary["last_frame_index"] = frame_index
 
                             save_stage_artifacts = frame_index % crop_save_interval == 0
+                            save_stage_artifacts = save_artifacts and save_stage_artifacts
                             frame_output_dir = (
                                 paths.region_output_root
                                 / f"track_{tracker_id}"
@@ -1112,7 +1280,6 @@ class StreamPipeline:
 
                 if self._cancel_requested():
                     raise StreamPipelineCancelled("Job cancelled by user.")
-                frame_index += 1
 
             if ppe_detections_file is not None:
                 ppe_detections_file.flush()
@@ -1153,8 +1320,8 @@ class StreamPipeline:
             self._write_summary(summary)
             raise
         finally:
-            if cap is not None:
-                cap.release()
+            if frame_reader is not None:
+                frame_reader.close()
             if ppe_detections_file is not None:
                 ppe_detections_file.close()
             if behavior_events_file is not None:

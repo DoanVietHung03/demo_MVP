@@ -251,6 +251,7 @@ class RunJobManagementTests(unittest.TestCase):
                     "run_facemask_detection": True,
                     "run_glove_detection": True,
                     "run_behavior_detection": False,
+                    "save_artifacts": False,
                     "source_is_upload": False,
                     "uploaded_source_path": None,
                     "status": "ready",
@@ -303,6 +304,7 @@ class RunJobManagementTests(unittest.TestCase):
             self.assertTrue(FakePipeline.last_config.run_facemask_detection)
             self.assertTrue(FakePipeline.last_config.run_glove_detection)
             self.assertFalse(FakePipeline.last_config.run_behavior_detection)
+            self.assertFalse(FakePipeline.last_config.save_artifacts)
 
     def test_pause_and_resume_job_update_status_flags(self) -> None:
         with web_app.JOB_STORE_LOCK:

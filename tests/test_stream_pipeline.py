@@ -23,6 +23,7 @@ class FakeCapture:
         self.frames = [frame.copy() for frame in frames]
         self.index = 0
         self.released = False
+        self.properties = {}
 
     def isOpened(self) -> bool:
         return True
@@ -38,6 +39,10 @@ class FakeCapture:
         if prop_id == cv2.CAP_PROP_FRAME_COUNT:
             return len(self.frames)
         return 0
+
+    def set(self, prop_id, value) -> bool:
+        self.properties[prop_id] = value
+        return True
 
     def release(self) -> None:
         self.released = True
@@ -155,6 +160,30 @@ class FakePPEDetectionPipeline:
                 },
             )()
         ]
+
+
+class FakeLatestFrameReader:
+    def __init__(self, _source, buffer_size=None) -> None:
+        self.buffer_size = buffer_size
+        self.total_frames = None
+        self._frames = [
+            np.zeros((40, 40, 3), dtype=np.uint8),
+            np.full((40, 40, 3), 32, dtype=np.uint8),
+        ]
+        self._index = 0
+        self.closed = False
+
+    def read_next(self, timeout_seconds: float = 0.0):
+        _ = timeout_seconds
+        if self._index >= len(self._frames):
+            return "eof", None, None
+        frame = self._frames[self._index]
+        frame_index = self._index
+        self._index += 1
+        return "frame", frame_index, frame.copy()
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class StreamPipelineTests(unittest.TestCase):
@@ -321,4 +350,88 @@ class StreamPipelineTests(unittest.TestCase):
             )
             self.assertEqual(frame_events, [(0, 1, 255, 0)])
 
+        log_queue_mock.join.assert_called_once()
+
+    @patch("stream_pipeline.pipeline.log_queue")
+    @patch("stream_pipeline.pipeline.enqueue_log_item", return_value=True)
+    @patch("stream_pipeline.pipeline.classify_glove_image")
+    @patch("stream_pipeline.pipeline.load_tflite_glove_classifier")
+    @patch("stream_pipeline.pipeline.run_facemask_inference")
+    @patch("stream_pipeline.pipeline.load_facemask_inference_engine")
+    @patch("stream_pipeline.pipeline.PersonRegionExtractor", side_effect=FakeRegionExtractor)
+    @patch("stream_pipeline.pipeline.PersonDetectionPipeline", side_effect=FakePersonPipeline)
+    @patch("stream_pipeline.pipeline.LatestFrameReader", side_effect=FakeLatestFrameReader)
+    def test_run_stream_pipeline_can_disable_artifact_writes_for_stream_sources(
+        self,
+        latest_reader_mock,
+        _person_pipeline_cls,
+        _region_extractor_cls,
+        _load_facemask_engine_mock,
+        run_facemask_inference_mock,
+        load_glove_classifier_mock,
+        classify_glove_image_mock,
+        enqueue_log_item_mock,
+        log_queue_mock,
+    ) -> None:
+        _load_facemask_engine_mock.return_value = type(
+            "FaceEngine",
+            (),
+            {"device": "cpu", "backend": "onnx", "onnx_session": None},
+        )()
+        run_facemask_inference_mock.return_value = [
+            FaceMaskDetection(
+                class_id=0,
+                class_name="Mask",
+                confidence=0.88,
+                bbox_xyxy=(0, 0, 10, 10),
+            )
+        ]
+        load_glove_classifier_mock.return_value = object()
+        classify_glove_image_mock.return_value = GloveClassification(
+            class_index=0,
+            raw_label="glove",
+            normalized_label="Glove",
+            confidence=0.82,
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            config = StreamPipelineConfig(
+                source="rtsp://camera/stream1",
+                output_root=temp_dir,
+                job_name="rtsp_low_latency",
+                save_artifacts=False,
+                attribute_refresh_interval_frames=1,
+                summary_flush_interval_frames=1,
+            )
+            config.person_detection.device = "cpu"
+            config.person_detection.model_path = "./weights/onnx/yolo11n.onnx"
+            config.person_detection.max_frames = 2
+            config.person_region_extraction.device = "cpu"
+            config.facemask_detection.device = "cpu"
+
+            summary = StreamPipeline(config).run()
+
+            self.assertEqual(summary["status"], "completed")
+            self.assertEqual(
+                summary["stages"]["person_detection"]["summary"]["capture_mode"],
+                "latest-frame-thread",
+            )
+            self.assertFalse(
+                summary["stages"]["person_detection"]["summary"]["save_artifacts"]
+            )
+            self.assertEqual(
+                summary["stages"]["person_detection"]["summary"]["crop_file_count"],
+                0,
+            )
+            self.assertEqual(
+                summary["stages"]["person_region_extraction"]["summary"]["saved_count"],
+                0,
+            )
+            self.assertFalse(Path(summary["paths"]["crops_dir"]).exists())
+            self.assertFalse(
+                Path(summary["paths"]["region_output_root"]).exists()
+            )
+
+        latest_reader_mock.assert_called_once()
+        enqueue_log_item_mock.assert_not_called()
         log_queue_mock.join.assert_called_once()

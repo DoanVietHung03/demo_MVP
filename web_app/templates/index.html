@@ -343,6 +343,13 @@
                     <div class="hint">Simple mode: bạn chỉ cần bật stage muốn lấy kết quả. Nếu chọn `facemask` hoặc `glove`, app sẽ tự bật `person_region_extraction` và `person_detection` để job luôn hợp lệ.</div>
                     <div class="toggle-stack">
                         <label class="toggle">
+                            <input id="save_artifacts" type="checkbox" name="save_artifacts" value="1" {% if defaults.save_artifacts %}checked{% endif %}>
+                            <span>
+                                Lưu artifact realtime
+                                <span class="inline-note">Tắt mục này để giảm độ trễ RTSP: pipeline vẫn chạy, vẫn có preview và summary, nhưng không ghi crop/ảnh trung gian/jsonl xuống đĩa.</span>
+                            </span>
+                        </label>
+                        <label class="toggle">
                             <input id="run_person_detection" type="checkbox" name="run_person_detection" value="1" {% if defaults.run_person_detection %}checked{% endif %}>
                             <span>
                                 Chạy `person_detection`
