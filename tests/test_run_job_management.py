@@ -135,18 +135,18 @@ class RunJobManagementTests(unittest.TestCase):
                 self,
                 config,
                 stage_callback=None,
-                person_detection_frame_callback=None,
+                frame_callback=None,
             ) -> None:
                 self.config = config
                 FakePipeline.last_config = config
                 self.stage_callback = stage_callback
-                self.person_detection_frame_callback = person_detection_frame_callback
+                self.frame_callback = frame_callback
 
             def run(self):
                 assert self.stage_callback is not None
                 self.stage_callback("person_detection", "running", None)
-                if self.person_detection_frame_callback is not None:
-                    self.person_detection_frame_callback(
+                if self.frame_callback is not None:
+                    self.frame_callback(
                         0,
                         1,
                         np.zeros((10, 10, 3), dtype=np.uint8),
@@ -269,14 +269,14 @@ class RunJobManagementTests(unittest.TestCase):
                     "lock": threading.Lock(),
                 }
 
-            original_pipeline = web_app.MainPipeline
+            original_pipeline = web_app.StreamPipeline
             original_prune = web_app._prune_finished_jobs
             try:
-                web_app.MainPipeline = FakePipeline
+                web_app.StreamPipeline = FakePipeline
                 web_app._prune_finished_jobs = lambda max_terminal_jobs=web_app.MAX_RETAINED_TERMINAL_JOBS: None
                 web_app.run_job_worker("job123")
             finally:
-                web_app.MainPipeline = original_pipeline
+                web_app.StreamPipeline = original_pipeline
                 web_app._prune_finished_jobs = original_prune
 
             job_view = web_app._job_to_view("job123", web_app.JOB_STORE["job123"])

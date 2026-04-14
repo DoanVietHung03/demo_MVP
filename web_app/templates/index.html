@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Main Pipeline Dashboard</title>
+    <title>Stream Pipeline Dashboard</title>
     <style>
         :root {
             --bg: #000000;
@@ -248,8 +248,8 @@
     <div class="shell">
         <div class="topbar">
             <div>
-                <h1>MAIN PIPELINE DASHBOARD</h1>
-                <div class="sub">One-click web runner cho person detection, region extraction, facemask, glove và behavior tùy chọn</div>
+                <h1>STREAM PIPELINE DASHBOARD</h1>
+                <div class="sub">Web runner realtime cho RTSP hoặc video file với person, facemask, glove và behavior theo từng frame</div>
             </div>
             <a href="{{ url_for('history') }}" class="btn">Xem Lịch Sử Xử Lý</a>
         </div>
@@ -271,7 +271,7 @@
                             <input type="file" name="source_file" accept=".mp4,video/mp4">
                         </label>
                     </div>
-                    <div class="hint">Web hiện gọi trực tiếp `main_pipeline`. Preview MJPEG chỉ hiển thị trong lúc stage `person_detection` đang chạy; các stage phía sau tiếp tục xử lý nền trong cùng job.</div>
+                    <div class="hint">Web hiện gọi trực tiếp `stream_pipeline`. Các stage được bật sẽ chạy theo kiểu realtime trên cùng luồng frame, nên `facemask` và `glove` không còn phải chờ hết video hay RTSP mới bắt đầu.</div>
                     <div class="grid two">
                         <label>
                             Model
@@ -320,7 +320,7 @@
                             <input id="run_person_detection" type="checkbox" name="run_person_detection" value="1" {% if defaults.run_person_detection %}checked{% endif %}>
                             <span>
                                 Chạy `person_detection`
-                                <span class="inline-note">Stage gốc để tạo crop người và preview MJPEG trên web.</span>
+                                <span class="inline-note">Stage gốc để detect/track người theo từng frame và làm đầu vào cho region, facemask, glove.</span>
                             </span>
                         </label>
                         <label class="toggle">
@@ -348,11 +348,11 @@
                             <input id="run_behavior_detection" type="checkbox" name="run_behavior_detection" value="1" {% if defaults.run_behavior_detection %}checked{% endif %}>
                             <span>
                                 Chạy `behavior_detection`
-                                <span class="inline-note">Nhánh độc lập trên video nguồn, không phụ thuộc `region extraction`.</span>
+                                <span class="inline-note">Nhánh realtime độc lập trên full frame, có thể chạy cùng hoặc tách khỏi person/region.</span>
                             </span>
                         </label>
                     </div>
-                    <button type="submit">Chạy Pipeline</button>
+                    <button type="submit">Chạy Stream Pipeline</button>
                 </form>
             </section>
 
@@ -402,7 +402,7 @@
                     <div class="video-frame placeholder">
                         <div>
                             <strong style="display:block; color: var(--accent); margin-bottom:10px;">Chưa có stream đang chạy</strong>
-                            Điền cấu hình bên trái rồi bấm <em>Chạy Pipeline</em> để chạy các stage đã chọn trên web.
+                            Điền cấu hình bên trái rồi bấm <em>Chạy Stream Pipeline</em> để chạy các stage đã chọn theo kiểu realtime trên web.
                         </div>
                     </div>
                 {% endif %}

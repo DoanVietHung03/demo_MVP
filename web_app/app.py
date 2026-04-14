@@ -13,10 +13,10 @@ from urllib.parse import urlparse
 import cv2
 from flask import Flask, Response, abort, redirect, render_template, request, url_for
 
-from main_pipeline.config import CONFIG as MAIN_PIPELINE_CONFIG, MainPipelineConfig
-from main_pipeline.pipeline import MainPipeline
-from main_pipeline.types import StageRunResult
 from person_detection.config import CONFIG, PersonInstance
+from stream_pipeline.config import CONFIG as STREAM_PIPELINE_CONFIG, StreamPipelineConfig
+from stream_pipeline.pipeline import StreamPipeline
+from stream_pipeline.types import StageRunResult
 
 
 APP_ROOT = Path(__file__).resolve().parent.parent
@@ -171,11 +171,11 @@ def _defaults() -> Dict[str, object]:
         "track_ttl_frames": CONFIG.track_ttl_frames,
         "alert_cooldown_frames": CONFIG.alert_cooldown_frames,
         "max_frames": CONFIG.max_frames,
-        "run_person_detection": MAIN_PIPELINE_CONFIG.run_person_detection,
-        "run_region_extraction": MAIN_PIPELINE_CONFIG.run_region_extraction,
-        "run_facemask_detection": MAIN_PIPELINE_CONFIG.run_facemask_detection,
-        "run_glove_detection": MAIN_PIPELINE_CONFIG.run_glove_detection,
-        "run_behavior_detection": MAIN_PIPELINE_CONFIG.run_behavior_detection,
+        "run_person_detection": STREAM_PIPELINE_CONFIG.run_person_detection,
+        "run_region_extraction": STREAM_PIPELINE_CONFIG.run_region_extraction,
+        "run_facemask_detection": STREAM_PIPELINE_CONFIG.run_facemask_detection,
+        "run_glove_detection": STREAM_PIPELINE_CONFIG.run_glove_detection,
+        "run_behavior_detection": STREAM_PIPELINE_CONFIG.run_behavior_detection,
     }
 
 
@@ -238,6 +238,15 @@ def _job_status(job: Dict[str, object]) -> str:
     lock = job["lock"]
     with lock:
         return str(job["status"])
+
+
+def _display_stage_name(stage_name: Optional[object]) -> Optional[str]:
+    if stage_name is None:
+        return None
+    normalized = str(stage_name)
+    if normalized == "realtime_stream":
+        return "realtime stream"
+    return normalized
 
 
 def _is_terminal_status(status: str) -> bool:
@@ -307,7 +316,7 @@ def _job_to_view(job_id: str, job: Dict[str, object]) -> Dict[str, object]:
             "source_name": job["source_name"],
             "device": job["device"],
             "status": job["status"],
-            "current_stage": job.get("current_stage"),
+            "current_stage": _display_stage_name(job.get("current_stage")),
             "total_alerts": job["total_alerts"],
             "unique_track_count": job["unique_track_count"],
             "crop_dir": job["crop_dir"],
@@ -352,6 +361,7 @@ def _update_job_stage_state(
         raw_stage_states = job.get("stage_states")
         stage_states = dict(raw_stage_states) if isinstance(raw_stage_states, dict) else {}
         stage_state = dict(stage_states.get(stage_name, {}))
+        realtime_mode = str(job.get("pipeline_mode") or "").strip().lower() == "realtime"
         stage_state["enabled"] = (
             stage_result.enabled
             if stage_result is not None
@@ -370,23 +380,28 @@ def _update_job_stage_state(
         job["stage_states"] = stage_states
 
         if stage_status == "running":
-            job["current_stage"] = stage_name
-            job["status"] = "streaming" if stage_name == "person_detection" else "running"
+            if realtime_mode:
+                job["current_stage"] = "realtime_stream"
+                job["status"] = "streaming"
+            else:
+                job["current_stage"] = stage_name
+                job["status"] = "streaming" if stage_name == "person_detection" else "running"
         elif stage_status == "failed":
             job["current_stage"] = stage_name
             error_message = stage_state.get("error") or "unknown stage failure"
             job["status"] = f"error: {error_message}"
         elif stage_status == "completed":
-            job["current_stage"] = stage_name
+            if not realtime_mode:
+                job["current_stage"] = stage_name
         elif stage_status == "disabled" and job.get("current_stage") == stage_name:
             job["current_stage"] = None
 
 
-def _build_main_pipeline_config(
+def _build_stream_pipeline_config(
     job_id: str,
     job: Dict[str, object],
-) -> MainPipelineConfig:
-    config = replace(MAIN_PIPELINE_CONFIG)
+) -> StreamPipelineConfig:
+    config = replace(STREAM_PIPELINE_CONFIG)
     config.source = str(job["source"])
     config.output_root = str(RESULT_DIR)
     config.job_name = job_id
@@ -544,6 +559,7 @@ def start_job():
         "latest_frame_seq": -1,
         "latest_summary": None,
         "stage_states": _initial_stage_states(stage_flags),
+        "pipeline_mode": "realtime",
         "created_at": created_at,
         "finished_at": None,
         "lock": threading.Lock(),
@@ -601,6 +617,7 @@ def run_job_worker(job_id: str) -> None:
         return
 
     with job["lock"]:
+        job["pipeline_mode"] = str(job.get("pipeline_mode") or "realtime")
         job["unique_ids"] = set()
         job["total_alerts"] = 0
         job["unique_track_count"] = 0
@@ -622,8 +639,8 @@ def run_job_worker(job_id: str) -> None:
         job["status"] = "initializing"
 
     try:
-        pipeline_config = _build_main_pipeline_config(job_id, job)
-        pipeline = MainPipeline(
+        pipeline_config = _build_stream_pipeline_config(job_id, job)
+        pipeline = StreamPipeline(
             pipeline_config,
             stage_callback=lambda stage_name, stage_status, stage_result: _update_job_stage_state(
                 job_id,
@@ -631,7 +648,7 @@ def run_job_worker(job_id: str) -> None:
                 stage_status,
                 stage_result,
             ),
-            person_detection_frame_callback=lambda frame_index, _total_frames, annotated_frame, persons: _update_job_outputs(
+            frame_callback=lambda frame_index, _total_frames, annotated_frame, persons: _update_job_outputs(
                 job_id,
                 annotated_frame,
                 persons,
