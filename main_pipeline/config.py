@@ -19,15 +19,15 @@ from person_region_extraction.config import (
 
 @dataclass
 class MainPipelineConfig:
-    source: str = "./vid_test/vid_4.mp4"
+    source: str = "./vid_test/vid_2_2.mp4"
     output_root: str = "main_pipeline/output"
     job_name: Optional[str] = None
     run_person_detection: bool = True
-    run_ppe_detection: bool = True
+    run_ppe_detection: bool = False
     run_region_extraction: bool = True
     run_facemask_detection: bool = False
     run_glove_detection: bool = False
-    run_behavior_detection: bool = False
+    run_behavior_detection: bool = True
     attribute_refresh_interval_frames: int = 3
     summary_flush_interval_frames: int = 15
     save_annotated_video: bool = True

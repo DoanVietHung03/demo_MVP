@@ -91,7 +91,7 @@ class OfflineVideoRecorder:
         self.frame_count = 0
 
     def _probe_source_fps(self) -> float:
-        cap = cv2.VideoCapture(self.source)
+        cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
         try:
             fps = float(cap.get(cv2.CAP_PROP_FPS)) if cap.isOpened() else 0.0
         finally:
