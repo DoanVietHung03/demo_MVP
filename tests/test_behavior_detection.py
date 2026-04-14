@@ -9,7 +9,12 @@ import supervision as sv
 
 from behavior_detection.config import BehaviorDetectionConfig
 from behavior_detection.inference import filter_detections_by_class_names
-from behavior_detection.pipeline import BehaviorDetectionPipeline
+from behavior_detection.pipeline import (
+    BehaviorDetectionPipeline,
+    DetectionMatch,
+    TrackedPersonBehavior,
+    annotate_behavior_evidence,
+)
 
 
 class BehaviorDetectionInferenceTests(unittest.TestCase):
@@ -96,3 +101,35 @@ class BehaviorDetectionInferenceTests(unittest.TestCase):
             filter_mock.call_args_list[1].kwargs["confidence_threshold"],
             0.25,
         )
+
+    def test_annotate_behavior_evidence_draws_phone_and_smoke_boxes(self) -> None:
+        frame = np.zeros((48, 48, 3), dtype=np.uint8)
+        behaviors = [
+            TrackedPersonBehavior(
+                tracker_id=1,
+                bbox_xyxy=(4, 4, 32, 32),
+                label="id:1 0.90",
+                smoking_candidate=True,
+                phone_present=True,
+                phone_in_hand=True,
+                phone_usage=True,
+                events=[],
+                phone_match=DetectionMatch(
+                    bbox_xyxy=(10, 10, 18, 20),
+                    confidence=0.82,
+                    class_name="cell phone",
+                ),
+                smoke_match=DetectionMatch(
+                    bbox_xyxy=(20, 12, 26, 18),
+                    confidence=0.76,
+                    class_name="cigarette",
+                ),
+            )
+        ]
+
+        annotated = annotate_behavior_evidence(frame, behaviors)
+
+        self.assertEqual(int(frame.max()), 0)
+        self.assertGreater(int(annotated.max()), 0)
+        self.assertFalse(np.array_equal(annotated[10, 10], frame[10, 10]))
+        self.assertFalse(np.array_equal(annotated[12, 20], frame[12, 20]))

@@ -3,13 +3,17 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
-from behavior_detection.pipeline import BehaviorDetectionPipeline, TrackedPersonBehavior
+from behavior_detection.pipeline import (
+    BehaviorDetectionPipeline,
+    TrackedPersonBehavior,
+    annotate_behavior_evidence,
+)
 from facemask_detection.inference import (
     describe_facemask_inference_backend,
     load_facemask_inference_engine,
@@ -27,6 +31,10 @@ from glove_detection.pipeline import (
     annotate_image as annotate_glove_image,
     resolve_final_label,
 )
+from ppe_detection.pipeline import (
+    PPEDetectionPipeline,
+    annotate_image as annotate_ppe_image,
+)
 from person_detection.config import PersonInstance
 from person_detection.pipeline import PersonDetectionPipeline, enqueue_log_item, log_queue
 from person_region_extraction.pipeline import PersonRegionExtractor
@@ -36,6 +44,18 @@ from stream_pipeline.types import PipelinePaths, PipelineRunSummary, StageRunRes
 
 StageCallback = Callable[[str, str, Optional[StageRunResult]], None]
 FrameCallback = Callable[[int, Optional[int], np.ndarray, List[PersonInstance]], None]
+ControlCallback = Callable[[], bool]
+
+
+class StreamPipelineCancelled(Exception):
+    pass
+
+
+@dataclass
+class HandPrediction:
+    bbox_xyxy: Tuple[int, int, int, int]
+    label: str
+    confidence: float
 
 
 @dataclass
@@ -44,8 +64,10 @@ class TrackAttributeSnapshot:
     last_updated_frame_index: int
     mask_label: Optional[str] = None
     mask_confidence: float = 0.0
+    mask_bbox_xyxy: Optional[Tuple[int, int, int, int]] = None
     glove_label: Optional[str] = None
     glove_confidence: float = 0.0
+    hand_predictions: List[HandPrediction] = field(default_factory=list)
 
 
 def sanitize_job_name(value: str) -> str:
@@ -71,6 +93,7 @@ def build_pipeline_paths(
     return PipelinePaths(
         run_root=run_root,
         crops_dir=run_root / "crops",
+        ppe_output_root=run_root / "ppe_detection",
         region_output_root=run_root / "person_region_extraction",
         facemask_output_root=run_root / "facemask_detection",
         glove_output_root=run_root / "glove_detection",
@@ -151,6 +174,34 @@ def _annotate_person_attributes(
             background_color=(0, 70, 44),
         )
 
+        if snapshot.mask_bbox_xyxy is not None:
+            fx1, fy1, fx2, fy2 = snapshot.mask_bbox_xyxy
+            color = (0, 200, 0) if snapshot.mask_label == "Mask" else (0, 0, 255)
+            cv2.rectangle(annotated, (fx1, fy1), (fx2, fy2), color, 2)
+            if snapshot.mask_label:
+                _draw_text_chip(
+                    annotated,
+                    f"{snapshot.mask_label} {snapshot.mask_confidence:.2f}",
+                    (fx1 + 2, max(18, fy1 - 4)),
+                    background_color=color,
+                )
+
+        for hand_prediction in snapshot.hand_predictions:
+            hx1, hy1, hx2, hy2 = hand_prediction.bbox_xyxy
+            if hand_prediction.label == "Glove":
+                color = (0, 200, 0)
+            elif hand_prediction.label == "NoGlove":
+                color = (0, 0, 255)
+            else:
+                color = (0, 215, 255)
+            cv2.rectangle(annotated, (hx1, hy1), (hx2, hy2), color, 2)
+            _draw_text_chip(
+                annotated,
+                f"Hand:{hand_prediction.label} {hand_prediction.confidence:.2f}",
+                (hx1 + 2, min(frame_height - 8, hy2 + 16)),
+                background_color=color,
+            )
+
     return annotated
 
 
@@ -210,16 +261,36 @@ def _write_json(path: Path, payload: object) -> None:
     )
 
 
+def _offset_box(
+    box: Tuple[int, int, int, int],
+    offset_x: int,
+    offset_y: int,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
+) -> Tuple[int, int, int, int]:
+    x1, y1, x2, y2 = box
+    return (
+        int(round(offset_x + x1 * scale_x)),
+        int(round(offset_y + y1 * scale_y)),
+        int(round(offset_x + x2 * scale_x)),
+        int(round(offset_y + y2 * scale_y)),
+    )
+
+
 class StreamPipeline:
     def __init__(
         self,
         config: StreamPipelineConfig,
         stage_callback: Optional[StageCallback] = None,
         frame_callback: Optional[FrameCallback] = None,
+        should_pause: Optional[ControlCallback] = None,
+        should_cancel: Optional[ControlCallback] = None,
     ) -> None:
         self.config = config
         self.stage_callback = stage_callback
         self.frame_callback = frame_callback
+        self.should_pause = should_pause
+        self.should_cancel = should_cancel
 
     def _validate_stage_dependencies(self) -> None:
         if (
@@ -240,6 +311,7 @@ class StreamPipeline:
         if not any(
             [
                 self.config.run_person_detection,
+                self.config.run_ppe_detection,
                 self.config.run_region_extraction,
                 self.config.run_facemask_detection,
                 self.config.run_glove_detection,
@@ -278,6 +350,15 @@ class StreamPipeline:
             return
         stage_result.summary = dict(stage_summary)
 
+    def _cancel_requested(self) -> bool:
+        return bool(self.should_cancel is not None and self.should_cancel())
+
+    def _wait_while_paused(self) -> None:
+        while self.should_pause is not None and self.should_pause():
+            if self._cancel_requested():
+                raise StreamPipelineCancelled("Job cancelled by user.")
+            time.sleep(0.05)
+
     def run(self) -> Dict[str, object]:
         self._validate_stage_dependencies()
 
@@ -308,12 +389,14 @@ class StreamPipeline:
         )
 
         person_pipeline: Optional[PersonDetectionPipeline] = None
+        ppe_pipeline: Optional[PPEDetectionPipeline] = None
         region_extractor: Optional[PersonRegionExtractor] = None
         facemask_engine = None
         glove_classifier = None
         behavior_pipeline: Optional[BehaviorDetectionPipeline] = None
 
         person_summary: Dict[str, object] = {}
+        ppe_summary: Dict[str, object] = {}
         region_summary: Dict[str, object] = {}
         facemask_summary: Dict[str, object] = {}
         glove_summary: Dict[str, object] = {}
@@ -325,6 +408,7 @@ class StreamPipeline:
         seen_track_ids: set[int] = set()
 
         cap = None
+        ppe_detections_file = None
         behavior_events_file = None
         try:
             if self.config.run_person_detection:
@@ -376,6 +460,55 @@ class StreamPipeline:
                     "person_detection",
                     "disabled",
                     summary.stages["person_detection"],
+                )
+
+            if self.config.run_ppe_detection:
+                paths.ppe_output_root.mkdir(parents=True, exist_ok=True)
+                ppe_pipeline = PPEDetectionPipeline(self.config.ppe_detection)
+                ppe_summary = {
+                    "source": str(self.config.source),
+                    "output_root": str(paths.ppe_output_root),
+                    "detections_path": str(paths.ppe_output_root / "detections.jsonl"),
+                    "runtime_backend": ppe_pipeline.runtime_backend_label(),
+                    "model_path": self.config.ppe_detection.model_path,
+                    "processed_frames": 0,
+                    "emitted_detections": 0,
+                    "class_counts": {
+                        class_name: 0
+                        for class_name in self.config.ppe_detection.target_class_names
+                    },
+                }
+                summary.stages["ppe_detection"] = StageRunResult(
+                    name="ppe_detection",
+                    enabled=True,
+                    input_path=str(self.config.source),
+                    output_path=str(paths.ppe_output_root),
+                    summary=dict(ppe_summary),
+                )
+                print(
+                    "[Stage Runtime] "
+                    f"ppe_detection(stream): {ppe_summary['runtime_backend']} | "
+                    f"device={ppe_pipeline.inference_engine.device} | "
+                    f"model={self.config.ppe_detection.model_path}"
+                )
+                self._notify_stage(
+                    "ppe_detection",
+                    "running",
+                    summary.stages["ppe_detection"],
+                )
+                started_stage_names.append("ppe_detection")
+                ppe_detections_file = (
+                    paths.ppe_output_root / "detections.jsonl"
+                ).open("w", encoding="utf-8")
+            else:
+                summary.stages["ppe_detection"] = StageRunResult(
+                    name="ppe_detection",
+                    enabled=False,
+                )
+                self._notify_stage(
+                    "ppe_detection",
+                    "disabled",
+                    summary.stages["ppe_detection"],
                 )
 
             if self.config.run_region_extraction:
@@ -569,16 +702,15 @@ class StreamPipeline:
             summary.status = "running"
             self._write_summary(summary)
 
-            primary_frame_skip = (
-                int(self.config.person_detection.frame_skip)
-                if self.config.run_person_detection
-                else int(self.config.behavior_detection.frame_skip)
-            )
-            primary_max_frames = (
-                self.config.person_detection.max_frames
-                if self.config.run_person_detection
-                else self.config.behavior_detection.max_frames
-            )
+            if self.config.run_person_detection:
+                primary_frame_skip = int(self.config.person_detection.frame_skip)
+                primary_max_frames = self.config.person_detection.max_frames
+            elif self.config.run_ppe_detection:
+                primary_frame_skip = int(self.config.ppe_detection.frame_skip)
+                primary_max_frames = self.config.ppe_detection.max_frames
+            else:
+                primary_frame_skip = int(self.config.behavior_detection.frame_skip)
+                primary_max_frames = self.config.behavior_detection.max_frames
 
             cap = cv2.VideoCapture(self.config.source)
             if not cap.isOpened():
@@ -589,6 +721,9 @@ class StreamPipeline:
             frame_index = 0
 
             while True:
+                self._wait_while_paused()
+                if self._cancel_requested():
+                    raise StreamPipelineCancelled("Job cancelled by user.")
                 ok, frame = cap.read()
                 if not ok:
                     break
@@ -658,6 +793,7 @@ class StreamPipeline:
 
                             mask_label: Optional[str] = None
                             mask_confidence = 0.0
+                            mask_bbox_xyxy: Optional[Tuple[int, int, int, int]] = None
                             if facemask_engine is not None:
                                 detections = run_facemask_inference(
                                     facemask_engine,
@@ -672,6 +808,20 @@ class StreamPipeline:
                                     best_detection = detections[0]
                                     mask_label = best_detection.class_name
                                     mask_confidence = float(best_detection.confidence)
+                                    if regions.face_bbox is not None:
+                                        face_x1, face_y1, face_x2, face_y2 = regions.face_bbox
+                                        face_width = max(1, face_x2 - face_x1)
+                                        face_height = max(1, face_y2 - face_y1)
+                                        scale_x = face_width / max(1, regions.head_face.shape[1])
+                                        scale_y = face_height / max(1, regions.head_face.shape[0])
+                                        person_x1, person_y1, _, _ = person.bbox_xyxy
+                                        mask_bbox_xyxy = _offset_box(
+                                            best_detection.bbox_xyxy,
+                                            person_x1 + face_x1,
+                                            person_y1 + face_y1,
+                                            scale_x=scale_x,
+                                            scale_y=scale_y,
+                                        )
                                     if best_detection.class_name == "Mask":
                                         facemask_summary["mask_count"] = (
                                             int(facemask_summary["mask_count"]) + 1
@@ -727,41 +877,65 @@ class StreamPipeline:
 
                             glove_label: Optional[str] = None
                             glove_confidence = 0.0
+                            hand_predictions: List[HandPrediction] = []
                             if glove_classifier is not None:
-                                if regions.hands is None or regions.hands.size == 0:
-                                    classification = GloveClassification(
-                                        class_index=-1,
-                                        raw_label="unknown",
-                                        normalized_label="Uncertain",
-                                        confidence=0.0,
-                                    )
-                                else:
-                                    classification = classify_glove_image(
-                                        glove_classifier,
-                                        regions.hands,
-                                    )
+                                person_x1, person_y1, _, _ = person.bbox_xyxy
+                                for hand_box in regions.hand_bboxes:
+                                    hx1, hy1, hx2, hy2 = hand_box
+                                    hand_crop = person.crop[hy1:hy2, hx1:hx2]
+                                    if hand_crop.size == 0:
+                                        classification = GloveClassification(
+                                            class_index=-1,
+                                            raw_label="unknown",
+                                            normalized_label="Uncertain",
+                                            confidence=0.0,
+                                        )
+                                    else:
+                                        classification = classify_glove_image(
+                                            glove_classifier,
+                                            hand_crop,
+                                        )
 
-                                glove_label = resolve_final_label(
-                                    classification,
-                                    float(self.config.glove_detection.confidence_threshold),
-                                )
-                                glove_confidence = float(classification.confidence)
-                                glove_summary["processed_count"] = (
-                                    int(glove_summary["processed_count"]) + 1
-                                )
-                                glove_summary["last_frame_index"] = frame_index
-                                if glove_label == "Glove":
-                                    glove_summary["glove_count"] = (
-                                        int(glove_summary["glove_count"]) + 1
+                                    final_label = resolve_final_label(
+                                        classification,
+                                        float(self.config.glove_detection.confidence_threshold),
                                     )
-                                elif glove_label == "NoGlove":
-                                    glove_summary["no_glove_count"] = (
-                                        int(glove_summary["no_glove_count"]) + 1
+                                    global_hand_box = _offset_box(
+                                        hand_box,
+                                        person_x1,
+                                        person_y1,
                                     )
-                                else:
-                                    glove_summary["uncertain_count"] = (
-                                        int(glove_summary["uncertain_count"]) + 1
+                                    hand_predictions.append(
+                                        HandPrediction(
+                                            bbox_xyxy=global_hand_box,
+                                            label=final_label,
+                                            confidence=float(classification.confidence),
+                                        )
                                     )
+                                    glove_summary["processed_count"] = (
+                                        int(glove_summary["processed_count"]) + 1
+                                    )
+                                    glove_summary["last_frame_index"] = frame_index
+                                    if final_label == "Glove":
+                                        glove_summary["glove_count"] = (
+                                            int(glove_summary["glove_count"]) + 1
+                                        )
+                                    elif final_label == "NoGlove":
+                                        glove_summary["no_glove_count"] = (
+                                            int(glove_summary["no_glove_count"]) + 1
+                                        )
+                                    else:
+                                        glove_summary["uncertain_count"] = (
+                                            int(glove_summary["uncertain_count"]) + 1
+                                        )
+
+                                if hand_predictions:
+                                    best_hand_prediction = max(
+                                        hand_predictions,
+                                        key=lambda item: item.confidence,
+                                    )
+                                    glove_label = best_hand_prediction.label
+                                    glove_confidence = best_hand_prediction.confidence
 
                                 if save_stage_artifacts:
                                     glove_output_dir = (
@@ -770,19 +944,39 @@ class StreamPipeline:
                                         / f"frame_{frame_index:06d}"
                                     )
                                     glove_output_dir.mkdir(parents=True, exist_ok=True)
+                                    combined_classification = GloveClassification(
+                                        class_index=-1,
+                                        raw_label="combined",
+                                        normalized_label=glove_label or "Uncertain",
+                                        confidence=float(glove_confidence),
+                                    )
                                     annotated_hands = annotate_glove_image(
                                         regions.hands,
-                                        classification,
-                                        glove_label,
+                                        combined_classification,
+                                        glove_label or "Uncertain",
                                     )
                                     cv2.imwrite(
                                         str(glove_output_dir / "annotated.jpg"),
                                         annotated_hands,
                                     )
-                                    prediction_payload = json.loads(
-                                        classify_glove_to_json(classification)
-                                    )
-                                    prediction_payload["final_label"] = glove_label
+                                    prediction_payload = {
+                                        "final_label": glove_label or "Uncertain",
+                                        "confidence": round(float(glove_confidence), 6),
+                                        "confidence_threshold": float(
+                                            self.config.glove_detection.confidence_threshold
+                                        ),
+                                        "hands": [
+                                            {
+                                                "bbox_xyxy": list(hand_prediction.bbox_xyxy),
+                                                "label": hand_prediction.label,
+                                                "confidence": round(
+                                                    hand_prediction.confidence,
+                                                    6,
+                                                ),
+                                            }
+                                            for hand_prediction in hand_predictions
+                                        ],
+                                    }
                                     prediction_payload["confidence_threshold"] = float(
                                         self.config.glove_detection.confidence_threshold
                                     )
@@ -796,8 +990,10 @@ class StreamPipeline:
                                 last_updated_frame_index=frame_index,
                                 mask_label=mask_label,
                                 mask_confidence=mask_confidence,
+                                mask_bbox_xyxy=mask_bbox_xyxy,
                                 glove_label=glove_label,
                                 glove_confidence=glove_confidence,
+                                hand_predictions=hand_predictions,
                             )
 
                         stale_track_ids = [
@@ -815,6 +1011,42 @@ class StreamPipeline:
                             persons,
                             track_snapshots,
                         )
+
+                if ppe_pipeline is not None:
+                    ppe_records = ppe_pipeline.predict_records(frame)
+                    ppe_summary["processed_frames"] = int(ppe_summary["processed_frames"]) + 1
+                    ppe_summary["emitted_detections"] = (
+                        int(ppe_summary["emitted_detections"]) + len(ppe_records)
+                    )
+                    ppe_summary["last_frame_index"] = frame_index
+                    class_counts = ppe_summary.get("class_counts")
+                    if not isinstance(class_counts, dict):
+                        class_counts = {}
+                    for record in ppe_records:
+                        normalized_class_name = record.class_name.lower()
+                        class_counts[normalized_class_name] = int(
+                            class_counts.get(normalized_class_name, 0)
+                        ) + 1
+                    ppe_summary["class_counts"] = class_counts
+                    if ppe_detections_file is not None and ppe_records:
+                        ppe_detections_file.write(
+                            json.dumps(
+                                {
+                                    "frame_index": frame_index,
+                                    "detections": [
+                                        {
+                                            "class_name": record.class_name,
+                                            "confidence": round(record.confidence, 6),
+                                            "bbox_xyxy": list(record.bbox_xyxy),
+                                        }
+                                        for record in ppe_records
+                                    ],
+                                },
+                                ensure_ascii=True,
+                            )
+                            + "\n"
+                        )
+                    annotated_frame = annotate_ppe_image(annotated_frame, ppe_records)
 
                 if behavior_pipeline is not None:
                     behavior_annotated_frame, behaviors, events = behavior_pipeline.process_frame(
@@ -843,9 +1075,13 @@ class StreamPipeline:
                                 + "\n"
                             )
 
-                    if person_pipeline is None:
+                    if person_pipeline is None and ppe_pipeline is None:
                         annotated_frame = behavior_annotated_frame
                     else:
+                        annotated_frame = annotate_behavior_evidence(
+                            annotated_frame,
+                            behaviors,
+                        )
                         annotated_frame = _overlay_behavior_summary(
                             annotated_frame,
                             behaviors,
@@ -861,6 +1097,7 @@ class StreamPipeline:
                     )
 
                 self._update_stage_summary(summary, "person_detection", person_summary)
+                self._update_stage_summary(summary, "ppe_detection", ppe_summary)
                 self._update_stage_summary(
                     summary,
                     "person_region_extraction",
@@ -873,8 +1110,12 @@ class StreamPipeline:
                 if frame_index % summary_flush_interval == 0:
                     self._write_summary(summary)
 
+                if self._cancel_requested():
+                    raise StreamPipelineCancelled("Job cancelled by user.")
                 frame_index += 1
 
+            if ppe_detections_file is not None:
+                ppe_detections_file.flush()
             if behavior_events_file is not None:
                 behavior_events_file.flush()
             log_queue.join()
@@ -885,6 +1126,18 @@ class StreamPipeline:
                 self._notify_stage(stage_name, "completed", stage_result)
 
             summary.status = "completed"
+            self._write_summary(summary)
+            return summary.to_dict()
+        except StreamPipelineCancelled as exc:
+            summary.status = "cancelled"
+            summary.error = str(exc)
+            for stage_name in started_stage_names:
+                stage_result = summary.stages.get(stage_name)
+                if stage_result is None:
+                    continue
+                stage_result.success = False
+                stage_result.error = str(exc)
+                self._notify_stage(stage_name, "cancelled", stage_result)
             self._write_summary(summary)
             return summary.to_dict()
         except Exception as exc:
@@ -902,5 +1155,7 @@ class StreamPipeline:
         finally:
             if cap is not None:
                 cap.release()
+            if ppe_detections_file is not None:
+                ppe_detections_file.close()
             if behavior_events_file is not None:
                 behavior_events_file.close()

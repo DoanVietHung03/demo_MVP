@@ -18,7 +18,7 @@ class PersonInstance:
 @dataclass
 class AppConfig:
     source: str = "./vid_test/vid_1.mp4"
-    model_path: str = "./weights/yolo11n.onnx"
+    model_path: str = "./weights/onnx/yolo11n.onnx"
     device: str = "cuda:0"
     output_dir: Optional[str] = "person_detection/output/crops"
     confidence_threshold: float = 0.5

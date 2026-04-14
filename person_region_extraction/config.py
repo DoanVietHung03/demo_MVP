@@ -10,7 +10,7 @@ class RegionExtractionConfig:
     input_crops_dir: Optional[str] = None
     output_root: str = "person_region_extraction/output"
     process_latest_job: bool = True
-    model_path: str = "./weights/yolo11n-pose.onnx"
+    model_path: str = "./weights/onnx/yolo11n-pose.onnx"
     device: str = "cuda:0"
     person_confidence_threshold: float = 0.25
     keypoint_confidence_threshold: float = 0.25

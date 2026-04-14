@@ -129,7 +129,7 @@ class TrackAlertMemory:
 class PersonDetectionPipeline:
     def __init__(
         self,
-        model_path: str = "./weights/yolo11n.pt",
+        model_path: str = "./weights/pytorch/yolo11n.pt",
         device: str = "cuda:0",
         confidence_threshold: float = 0.35,
         iou_threshold: float = 0.45,

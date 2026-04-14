@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import warnings
 from pathlib import Path
 from typing import Dict
@@ -18,12 +19,16 @@ except ImportError as exc:  # pragma: no cover - dependency is environment-speci
     ) from exc
 
 
+PYTORCH_WEIGHTS_DIR = Path("weights/pytorch")
+ONNX_WEIGHTS_DIR = Path("weights/onnx")
+
 DEFAULT_YOLO_MODELS: Dict[str, str] = {
-    "person_detection": "weights/yolo11n.pt",
-    "person_region_extraction": "weights/yolo11n-pose.pt",
-    "behavior_smoke": "weights/smoke.pt",
+    "person_detection": str(PYTORCH_WEIGHTS_DIR / "yolo11n.pt"),
+    "person_region_extraction": str(PYTORCH_WEIGHTS_DIR / "yolo11n-pose.pt"),
+    "behavior_smoke": str(PYTORCH_WEIGHTS_DIR / "smoke.pt"),
+    "ppe_detection": str(PYTORCH_WEIGHTS_DIR / "PPE.pt"),
 }
-DEFAULT_FACEMASK_MODEL = "weights/facemask.pth"
+DEFAULT_FACEMASK_MODEL = str(PYTORCH_WEIGHTS_DIR / "facemask.pth")
 
 
 def export_ultralytics_model(
@@ -36,6 +41,7 @@ def export_ultralytics_model(
     normalized_model_path = Path(model_path)
     if not normalized_model_path.exists():
         raise FileNotFoundError(f"Model not found: {normalized_model_path}")
+    ONNX_WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
 
     model = YOLO(str(normalized_model_path))
     exported_path = model.export(
@@ -47,6 +53,10 @@ def export_ultralytics_model(
         device=device,
     )
     exported_path_obj = Path(str(exported_path))
+    target_path = ONNX_WEIGHTS_DIR / f"{normalized_model_path.stem}.onnx"
+    if exported_path_obj.resolve() != target_path.resolve():
+        shutil.move(str(exported_path_obj), str(target_path))
+        exported_path_obj = target_path
     onnx.checker.check_model(str(exported_path_obj))
     return exported_path_obj
 
@@ -60,11 +70,12 @@ def export_facemask_model(
     normalized_model_path = Path(model_path)
     if not normalized_model_path.exists():
         raise FileNotFoundError(f"Facemask model not found: {normalized_model_path}")
+    ONNX_WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
 
     output_path_obj = (
         Path(output_path)
         if output_path
-        else normalized_model_path.with_suffix(".onnx")
+        else ONNX_WEIGHTS_DIR / f"{normalized_model_path.stem}.onnx"
     )
 
     _register_legacy_module()

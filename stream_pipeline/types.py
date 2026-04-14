@@ -31,6 +31,7 @@ class StageRunResult:
 class PipelinePaths:
     run_root: Path
     crops_dir: Path
+    ppe_output_root: Path
     region_output_root: Path
     facemask_output_root: Path
     glove_output_root: Path
@@ -41,6 +42,7 @@ class PipelinePaths:
         return {
             "run_root": str(self.run_root),
             "crops_dir": str(self.crops_dir),
+            "ppe_output_root": str(self.ppe_output_root),
             "region_output_root": str(self.region_output_root),
             "facemask_output_root": str(self.facemask_output_root),
             "glove_output_root": str(self.glove_output_root),
@@ -72,4 +74,3 @@ class PipelineRunSummary:
             },
             "error": self.error,
         }
-

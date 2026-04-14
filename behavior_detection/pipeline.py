@@ -74,6 +74,14 @@ class TrackBehaviorState:
 
 
 @dataclass
+class DetectionMatch:
+    bbox_xyxy: Tuple[int, int, int, int]
+    confidence: float
+    class_id: int = -1
+    class_name: Optional[str] = None
+
+
+@dataclass
 class TrackedPersonBehavior:
     tracker_id: int
     bbox_xyxy: Tuple[int, int, int, int]
@@ -83,6 +91,8 @@ class TrackedPersonBehavior:
     phone_in_hand: bool
     phone_usage: bool
     events: List[BehaviorEvent]
+    phone_match: Optional[DetectionMatch] = None
+    smoke_match: Optional[DetectionMatch] = None
 
 
 def _clip_bbox(
@@ -214,20 +224,38 @@ def _best_pose_for_person(
 def _detections_inside_person(
     detections: sv.Detections,
     person_box: Tuple[int, int, int, int],
-) -> List[Tuple[Tuple[int, int, int, int], float]]:
+) -> List[DetectionMatch]:
     if len(detections) == 0:
         return []
 
     confidence_array = detections.confidence
     if confidence_array is None:
         confidence_array = np.zeros(len(detections), dtype=float)
+    class_id_array = detections.class_id
+    if class_id_array is None:
+        class_id_array = np.full(len(detections), -1, dtype=int)
+    data_class_names = None
+    if isinstance(getattr(detections, "data", None), dict):
+        data_class_names = detections.data.get("class_name")
 
-    matches: List[Tuple[Tuple[int, int, int, int], float]] = []
-    for xyxy, confidence in zip(detections.xyxy, confidence_array):
+    matches: List[DetectionMatch] = []
+    for index, (xyxy, confidence, class_id) in enumerate(
+        zip(detections.xyxy, confidence_array, class_id_array)
+    ):
         box = tuple(int(value) for value in xyxy.astype(int))
         box_center = _bbox_center(box)
         if _point_in_box(box_center, person_box) or _iou(box, person_box) >= 0.05:
-            matches.append((box, float(confidence)))
+            class_name: Optional[str] = None
+            if data_class_names is not None and index < len(data_class_names):
+                class_name = str(data_class_names[index])
+            matches.append(
+                DetectionMatch(
+                    bbox_xyxy=box,
+                    confidence=float(confidence),
+                    class_id=int(class_id),
+                    class_name=class_name,
+                )
+            )
     return matches
 
 
@@ -235,6 +263,88 @@ def _update_streak(previous_value: int, condition: bool) -> int:
     if condition:
         return previous_value + 1
     return 0
+
+
+def _draw_text_chip(
+    image: np.ndarray,
+    text: str,
+    origin: Tuple[int, int],
+    text_color: Tuple[int, int, int] = (255, 255, 255),
+    background_color: Tuple[int, int, int] = (24, 24, 24),
+) -> None:
+    x_coord, y_coord = origin
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.45
+    thickness = 1
+    (text_width, text_height), baseline = cv2.getTextSize(
+        text,
+        font,
+        scale,
+        thickness,
+    )
+    top_left = (
+        max(0, x_coord - 4),
+        max(0, y_coord - text_height - baseline - 4),
+    )
+    bottom_right = (
+        min(image.shape[1], x_coord + text_width + 4),
+        min(image.shape[0], y_coord + baseline + 4),
+    )
+    cv2.rectangle(image, top_left, bottom_right, background_color, thickness=-1)
+    cv2.putText(
+        image,
+        text,
+        (x_coord, min(image.shape[0] - 4, y_coord)),
+        font,
+        scale,
+        text_color,
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
+def annotate_behavior_evidence(
+    image: np.ndarray,
+    behaviors: Sequence[TrackedPersonBehavior],
+) -> np.ndarray:
+    annotated = image.copy()
+
+    for behavior in behaviors:
+        phone_match = behavior.phone_match
+        if phone_match is not None:
+            px1, py1, px2, py2 = phone_match.bbox_xyxy
+            phone_color = (255, 180, 0)
+            cv2.rectangle(annotated, (px1, py1), (px2, py2), phone_color, 2)
+            if behavior.phone_usage:
+                phone_state = "PhoneUse"
+            elif behavior.phone_in_hand:
+                phone_state = "PhoneHand"
+            else:
+                phone_state = "Phone"
+            _draw_text_chip(
+                annotated,
+                f"{phone_state} {phone_match.confidence:.2f}",
+                (px1 + 2, max(18, py1 - 4)),
+                background_color=phone_color,
+                text_color=(0, 0, 0),
+            )
+
+        smoke_match = behavior.smoke_match
+        if smoke_match is not None:
+            sx1, sy1, sx2, sy2 = smoke_match.bbox_xyxy
+            smoke_color = (0, 140, 255)
+            cv2.rectangle(annotated, (sx1, sy1), (sx2, sy2), smoke_color, 2)
+            smoke_name = (smoke_match.class_name or "smoke").replace("_", " ").title()
+            smoke_state = "Smoking" if behavior.smoking_candidate else smoke_name
+            _draw_text_chip(
+                annotated,
+                f"{smoke_state} {smoke_match.confidence:.2f}",
+                (sx1 + 2, min(annotated.shape[0] - 8, sy2 + 16)),
+                background_color=smoke_color,
+                text_color=(0, 0, 0),
+            )
+
+    return annotated
 
 
 class BehaviorDetectionPipeline:
@@ -400,10 +510,16 @@ class BehaviorDetectionPipeline:
             smoking_candidate = False
             phone_best_conf = 0.0
             smoking_best_conf = 0.0
+            best_phone_match: Optional[DetectionMatch] = None
+            best_smoke_match: Optional[DetectionMatch] = None
 
             if person_phone_matches:
-                best_phone_box, phone_best_conf = max(person_phone_matches, key=lambda item: item[1])
-                phone_center = _bbox_center(best_phone_box)
+                best_phone_match = max(
+                    person_phone_matches,
+                    key=lambda item: item.confidence,
+                )
+                phone_best_conf = best_phone_match.confidence
+                phone_center = _bbox_center(best_phone_match.bbox_xyxy)
                 near_hand = any(
                     _distance(phone_center, wrist_point)
                     <= person_diag * self.config.phone_hand_distance_ratio
@@ -417,8 +533,12 @@ class BehaviorDetectionPipeline:
                 phone_usage = near_hand or near_face
 
             if person_smoke_matches:
-                best_smoke_box, smoking_best_conf = max(person_smoke_matches, key=lambda item: item[1])
-                smoke_center = _bbox_center(best_smoke_box)
+                best_smoke_match = max(
+                    person_smoke_matches,
+                    key=lambda item: item.confidence,
+                )
+                smoking_best_conf = best_smoke_match.confidence
+                smoke_center = _bbox_center(best_smoke_match.bbox_xyxy)
                 smoke_near_mouth = (
                     _distance(smoke_center, mouth_point)
                     <= person_diag * self.config.smoking_mouth_distance_ratio
@@ -543,6 +663,8 @@ class BehaviorDetectionPipeline:
                     phone_in_hand=phone_in_hand,
                     phone_usage=phone_usage,
                     events=person_events,
+                    phone_match=best_phone_match,
+                    smoke_match=best_smoke_match,
                 )
             )
             events.extend(person_events)
@@ -565,6 +687,7 @@ class BehaviorDetectionPipeline:
             detections=valid_tracked_detections,
             labels=labels,
         )
+        annotated_frame = annotate_behavior_evidence(annotated_frame, behaviors)
         return annotated_frame, behaviors, events
 
     def process_video(

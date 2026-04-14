@@ -96,6 +96,7 @@ class RunJobManagementTests(unittest.TestCase):
     def test_normalize_stage_selection_auto_enables_dependencies(self) -> None:
         stage_flags = web_app._normalize_stage_selection(
             run_person_detection=False,
+            run_ppe_detection=False,
             run_region_extraction=False,
             run_facemask_detection=True,
             run_glove_detection=False,
@@ -112,6 +113,7 @@ class RunJobManagementTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "ít nhất 1 stage"):
             web_app._normalize_stage_selection(
                 run_person_detection=False,
+                run_ppe_detection=False,
                 run_region_extraction=False,
                 run_facemask_detection=False,
                 run_glove_detection=False,
@@ -136,11 +138,15 @@ class RunJobManagementTests(unittest.TestCase):
                 config,
                 stage_callback=None,
                 frame_callback=None,
+                should_pause=None,
+                should_cancel=None,
             ) -> None:
                 self.config = config
                 FakePipeline.last_config = config
                 self.stage_callback = stage_callback
                 self.frame_callback = frame_callback
+                self.should_pause = should_pause
+                self.should_cancel = should_cancel
 
             def run(self):
                 assert self.stage_callback is not None
@@ -224,7 +230,7 @@ class RunJobManagementTests(unittest.TestCase):
                 web_app.JOB_STORE["job123"] = {
                     "source": "./vid_test/vid_1.mp4",
                     "source_name": "vid_1.mp4",
-                    "model_path": "./weights/yolo11n.pt",
+                    "model_path": "./weights/onnx/yolo11n.onnx",
                     "device": "cpu",
                     "confidence_threshold": 0.5,
                     "iou_threshold": 0.45,
@@ -240,6 +246,7 @@ class RunJobManagementTests(unittest.TestCase):
                     "pipeline_output_root": str(temp_root),
                     "summary_path": str(temp_root / "summary.json"),
                     "run_person_detection": True,
+                    "run_ppe_detection": False,
                     "run_region_extraction": True,
                     "run_facemask_detection": True,
                     "run_glove_detection": True,
@@ -258,6 +265,7 @@ class RunJobManagementTests(unittest.TestCase):
                     "stage_states": web_app._initial_stage_states(
                         {
                             "run_person_detection": True,
+                            "run_ppe_detection": False,
                             "run_region_extraction": True,
                             "run_facemask_detection": True,
                             "run_glove_detection": True,
@@ -290,7 +298,42 @@ class RunJobManagementTests(unittest.TestCase):
             self.assertIn("person_detection", stage_names)
             self.assertIn("facemask_detection", stage_names)
             self.assertTrue(FakePipeline.last_config.run_person_detection)
+            self.assertFalse(FakePipeline.last_config.run_ppe_detection)
             self.assertTrue(FakePipeline.last_config.run_region_extraction)
             self.assertTrue(FakePipeline.last_config.run_facemask_detection)
             self.assertTrue(FakePipeline.last_config.run_glove_detection)
             self.assertFalse(FakePipeline.last_config.run_behavior_detection)
+
+    def test_pause_and_resume_job_update_status_flags(self) -> None:
+        with web_app.JOB_STORE_LOCK:
+            web_app.JOB_STORE["job_pause"] = {
+                "status": "streaming",
+                "pause_requested": False,
+                "cancel_requested": False,
+                "lock": threading.Lock(),
+            }
+
+        self.assertTrue(web_app._set_job_paused("job_pause", True))
+        with web_app.JOB_STORE_LOCK:
+            self.assertEqual(web_app.JOB_STORE["job_pause"]["status"], "paused")
+            self.assertTrue(web_app.JOB_STORE["job_pause"]["pause_requested"])
+
+        self.assertTrue(web_app._set_job_paused("job_pause", False))
+        with web_app.JOB_STORE_LOCK:
+            self.assertEqual(web_app.JOB_STORE["job_pause"]["status"], "streaming")
+            self.assertFalse(web_app.JOB_STORE["job_pause"]["pause_requested"])
+
+    def test_cancel_job_sets_cancelling_state(self) -> None:
+        with web_app.JOB_STORE_LOCK:
+            web_app.JOB_STORE["job_cancel"] = {
+                "status": "streaming",
+                "pause_requested": True,
+                "cancel_requested": False,
+                "lock": threading.Lock(),
+            }
+
+        self.assertTrue(web_app._cancel_job("job_cancel"))
+        with web_app.JOB_STORE_LOCK:
+            self.assertEqual(web_app.JOB_STORE["job_cancel"]["status"], "cancelling")
+            self.assertFalse(web_app.JOB_STORE["job_cancel"]["pause_requested"])
+            self.assertTrue(web_app.JOB_STORE["job_cancel"]["cancel_requested"])

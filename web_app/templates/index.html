@@ -209,6 +209,32 @@
             line-height: 1.5;
             word-break: break-word;
         }
+        .control-row {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-top: 14px;
+        }
+        .button-form {
+            margin: 0;
+            display: inline;
+        }
+        .button-form button {
+            width: auto;
+            min-width: 132px;
+            padding: 10px 14px;
+            border-radius: 10px;
+        }
+        .button-form .secondary {
+            background: #161616;
+            color: var(--accent);
+            border: 1px solid rgba(0, 255, 136, 0.45);
+        }
+        .button-form .danger {
+            background: #3a0d12;
+            color: #fecaca;
+            border: 1px solid #7f1d1d;
+        }
         .stage-list {
             display: grid;
             gap: 10px;
@@ -271,7 +297,7 @@
                             <input type="file" name="source_file" accept=".mp4,video/mp4">
                         </label>
                     </div>
-                    <div class="hint">Web hiện gọi trực tiếp `stream_pipeline`. Các stage được bật sẽ chạy theo kiểu realtime trên cùng luồng frame, nên `facemask` và `glove` không còn phải chờ hết video hay RTSP mới bắt đầu.</div>
+                    <div class="hint">Web hiện gọi trực tiếp `stream_pipeline`. Các stage được bật sẽ chạy theo kiểu realtime trên cùng luồng frame, nên `facemask`, `glove` và `ppe_detection` không còn phải chờ hết video hay RTSP mới bắt đầu. Preview giờ cũng overlay luôn bbox/nhãn cho mặt, tay và PPE khi các stage đó có kết quả.</div>
                     <div class="grid two">
                         <label>
                             Model
@@ -324,6 +350,13 @@
                             </span>
                         </label>
                         <label class="toggle">
+                            <input id="run_ppe_detection" type="checkbox" name="run_ppe_detection" value="1" {% if defaults.run_ppe_detection %}checked{% endif %}>
+                            <span>
+                                Chạy `ppe_detection`
+                                <span class="inline-note">Detect `hardhat` và `vest` trực tiếp trên full frame bằng model PPE riêng.</span>
+                            </span>
+                        </label>
+                        <label class="toggle">
                             <input id="run_region_extraction" type="checkbox" name="run_region_extraction" value="1" {% if defaults.run_region_extraction %}checked{% endif %}>
                             <span>
                                 Chạy `person_region_extraction`
@@ -362,6 +395,22 @@
                         <img src="{{ url_for('video_feed', job_id=current_job.job_id) }}" alt="Live Video Feed">
                     </div>
                     <div class="status-bar">● Job {{ current_job.job_id }} | Source: {{ current_job.source_name }} | Device: {{ current_job.device }} | Stage: {{ current_job.current_stage or 'waiting' }}</div>
+                    <div class="control-row">
+                        {% if current_job.status == 'paused' %}
+                            <form class="button-form" method="post" action="{{ url_for('resume_job', job_id=current_job.job_id) }}">
+                                <button class="secondary" type="submit">Tiếp Tục</button>
+                            </form>
+                        {% elif current_job.status in ['ready', 'initializing', 'running', 'streaming'] %}
+                            <form class="button-form" method="post" action="{{ url_for('pause_job', job_id=current_job.job_id) }}">
+                                <button class="secondary" type="submit">Tạm Dừng</button>
+                            </form>
+                        {% endif %}
+                        {% if current_job.status in ['ready', 'initializing', 'running', 'streaming', 'paused', 'cancelling'] %}
+                            <form class="button-form" method="post" action="{{ url_for('cancel_job', job_id=current_job.job_id) }}">
+                                <button class="danger" type="submit">Hủy Job</button>
+                            </form>
+                        {% endif %}
+                    </div>
                     <div class="meta">
                         <div class="meta-card">
                             <strong>{{ current_job.status }}</strong>

@@ -33,11 +33,12 @@ app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024 * 1024
 
 JOB_STORE: Dict[str, Dict[str, object]] = {}
 JOB_STORE_LOCK = threading.Lock()
-ACTIVE_JOB_STATUSES = {"ready", "initializing", "running", "streaming"}
+ACTIVE_JOB_STATUSES = {"ready", "initializing", "running", "streaming", "paused", "cancelling"}
 MAX_CONCURRENT_WEB_JOBS = 1
 MAX_RETAINED_TERMINAL_JOBS = 10
 PIPELINE_STAGE_ORDER = [
     "person_detection",
+    "ppe_detection",
     "person_region_extraction",
     "facemask_detection",
     "glove_detection",
@@ -45,6 +46,7 @@ PIPELINE_STAGE_ORDER = [
 ]
 PIPELINE_STAGE_LABELS = {
     "person_detection": "Person Detection",
+    "ppe_detection": "PPE Detection",
     "person_region_extraction": "Region Extraction",
     "facemask_detection": "Facemask Detection",
     "glove_detection": "Glove Detection",
@@ -84,6 +86,7 @@ def _parse_checkbox(raw_value: Optional[str]) -> bool:
 
 def _normalize_stage_selection(
     run_person_detection: bool,
+    run_ppe_detection: bool,
     run_region_extraction: bool,
     run_facemask_detection: bool,
     run_glove_detection: bool,
@@ -91,6 +94,7 @@ def _normalize_stage_selection(
 ) -> Dict[str, bool]:
     normalized = {
         "run_person_detection": bool(run_person_detection),
+        "run_ppe_detection": bool(run_ppe_detection),
         "run_region_extraction": bool(run_region_extraction),
         "run_facemask_detection": bool(run_facemask_detection),
         "run_glove_detection": bool(run_glove_detection),
@@ -113,6 +117,10 @@ def _initial_stage_states(stage_flags: Dict[str, bool]) -> Dict[str, Dict[str, o
         "person_detection": {
             "enabled": bool(stage_flags["run_person_detection"]),
             "status": "pending" if stage_flags["run_person_detection"] else "disabled",
+        },
+        "ppe_detection": {
+            "enabled": bool(stage_flags["run_ppe_detection"]),
+            "status": "pending" if stage_flags["run_ppe_detection"] else "disabled",
         },
         "person_region_extraction": {
             "enabled": bool(stage_flags["run_region_extraction"]),
@@ -172,6 +180,7 @@ def _defaults() -> Dict[str, object]:
         "alert_cooldown_frames": CONFIG.alert_cooldown_frames,
         "max_frames": CONFIG.max_frames,
         "run_person_detection": STREAM_PIPELINE_CONFIG.run_person_detection,
+        "run_ppe_detection": STREAM_PIPELINE_CONFIG.run_ppe_detection,
         "run_region_extraction": STREAM_PIPELINE_CONFIG.run_region_extraction,
         "run_facemask_detection": STREAM_PIPELINE_CONFIG.run_facemask_detection,
         "run_glove_detection": STREAM_PIPELINE_CONFIG.run_glove_detection,
@@ -201,6 +210,7 @@ def _defaults_from_form(form) -> Dict[str, object]:
     )
     defaults["max_frames"] = form.get("max_frames") or defaults["max_frames"]
     defaults["run_person_detection"] = _parse_checkbox(form.get("run_person_detection"))
+    defaults["run_ppe_detection"] = _parse_checkbox(form.get("run_ppe_detection"))
     defaults["run_region_extraction"] = _parse_checkbox(form.get("run_region_extraction"))
     defaults["run_facemask_detection"] = _parse_checkbox(form.get("run_facemask_detection"))
     defaults["run_glove_detection"] = _parse_checkbox(form.get("run_glove_detection"))
@@ -250,7 +260,7 @@ def _display_stage_name(stage_name: Optional[object]) -> Optional[str]:
 
 
 def _is_terminal_status(status: str) -> bool:
-    return status == "completed" or status.startswith("error")
+    return status in {"completed", "cancelled"} or status.startswith("error")
 
 
 def _is_active_status(status: str) -> bool:
@@ -322,6 +332,8 @@ def _job_to_view(job_id: str, job: Dict[str, object]) -> Dict[str, object]:
             "crop_dir": job["crop_dir"],
             "pipeline_output_root": job.get("pipeline_output_root"),
             "summary_path": job.get("summary_path"),
+            "pause_requested": bool(job.get("pause_requested")),
+            "cancel_requested": bool(job.get("cancel_requested")),
         }
     view["stage_views"] = _stage_views(job)
     return view
@@ -390,11 +402,55 @@ def _update_job_stage_state(
             job["current_stage"] = stage_name
             error_message = stage_state.get("error") or "unknown stage failure"
             job["status"] = f"error: {error_message}"
+        elif stage_status == "cancelled":
+            job["current_stage"] = "cancelled"
+            job["status"] = "cancelled"
         elif stage_status == "completed":
             if not realtime_mode:
                 job["current_stage"] = stage_name
         elif stage_status == "disabled" and job.get("current_stage") == stage_name:
             job["current_stage"] = None
+
+
+def _job_control_flags(job: Dict[str, object]) -> Dict[str, bool]:
+    lock = job["lock"]
+    with lock:
+        return {
+            "pause_requested": bool(job.get("pause_requested")),
+            "cancel_requested": bool(job.get("cancel_requested")),
+        }
+
+
+def _set_job_paused(job_id: str, paused: bool) -> bool:
+    job = _get_job(job_id)
+    if job is None:
+        return False
+
+    with job["lock"]:
+        status = str(job.get("status", ""))
+        if _is_terminal_status(status):
+            return False
+        job["pause_requested"] = paused
+        if paused:
+            job["status"] = "paused"
+        elif status == "paused":
+            job["status"] = "streaming"
+    return True
+
+
+def _cancel_job(job_id: str) -> bool:
+    job = _get_job(job_id)
+    if job is None:
+        return False
+
+    with job["lock"]:
+        status = str(job.get("status", ""))
+        if _is_terminal_status(status):
+            return False
+        job["pause_requested"] = False
+        job["cancel_requested"] = True
+        job["status"] = "cancelling"
+    return True
 
 
 def _build_stream_pipeline_config(
@@ -406,6 +462,7 @@ def _build_stream_pipeline_config(
     config.output_root = str(RESULT_DIR)
     config.job_name = job_id
     config.run_person_detection = bool(job.get("run_person_detection"))
+    config.run_ppe_detection = bool(job.get("run_ppe_detection"))
     config.run_region_extraction = bool(job.get("run_region_extraction"))
     config.run_facemask_detection = bool(job.get("run_facemask_detection"))
     config.run_glove_detection = bool(job.get("run_glove_detection"))
@@ -425,6 +482,16 @@ def _build_stream_pipeline_config(
     person_config.alert_cooldown_frames = job["alert_cooldown_frames"]
     person_config.max_frames = job["max_frames"]
     config.person_detection = person_config
+
+    ppe_config = replace(config.ppe_detection)
+    ppe_config.source = str(job["source"])
+    ppe_config.confidence_threshold = float(job["confidence_threshold"])
+    ppe_config.device = str(job["device"])
+    ppe_config.frame_skip = int(job["frame_skip"])
+    ppe_config.max_frames = job["max_frames"]
+    ppe_config.iou_threshold = float(job["iou_threshold"])
+    ppe_config.input_resize_scale = float(job["input_resize_scale"])
+    config.ppe_detection = ppe_config
 
     region_config = replace(config.person_region_extraction)
     region_config.device = str(job["device"])
@@ -498,6 +565,7 @@ def start_job():
     try:
         stage_flags = _normalize_stage_selection(
             run_person_detection=_parse_checkbox(request.form.get("run_person_detection")),
+            run_ppe_detection=_parse_checkbox(request.form.get("run_ppe_detection")),
             run_region_extraction=_parse_checkbox(request.form.get("run_region_extraction")),
             run_facemask_detection=_parse_checkbox(request.form.get("run_facemask_detection")),
             run_glove_detection=_parse_checkbox(request.form.get("run_glove_detection")),
@@ -543,6 +611,7 @@ def start_job():
         "pipeline_output_root": str(job_dir),
         "summary_path": str(job_dir / "summary.json"),
         "run_person_detection": stage_flags["run_person_detection"],
+        "run_ppe_detection": stage_flags["run_ppe_detection"],
         "run_region_extraction": stage_flags["run_region_extraction"],
         "run_facemask_detection": stage_flags["run_facemask_detection"],
         "run_glove_detection": stage_flags["run_glove_detection"],
@@ -560,6 +629,8 @@ def start_job():
         "latest_summary": None,
         "stage_states": _initial_stage_states(stage_flags),
         "pipeline_mode": "realtime",
+        "pause_requested": False,
+        "cancel_requested": False,
         "created_at": created_at,
         "finished_at": None,
         "lock": threading.Lock(),
@@ -570,6 +641,24 @@ def start_job():
     with JOB_STORE_LOCK:
         JOB_STORE[job_id]["worker"] = worker
     worker.start()
+    return redirect(url_for("index", job_id=job_id))
+
+
+@app.post("/pause/<job_id>")
+def pause_job(job_id: str):
+    _set_job_paused(job_id, True)
+    return redirect(url_for("index", job_id=job_id))
+
+
+@app.post("/resume/<job_id>")
+def resume_job(job_id: str):
+    _set_job_paused(job_id, False)
+    return redirect(url_for("index", job_id=job_id))
+
+
+@app.post("/cancel/<job_id>")
+def cancel_job(job_id: str):
+    _cancel_job(job_id)
     return redirect(url_for("index", job_id=job_id))
 
 
@@ -626,9 +715,12 @@ def run_job_worker(job_id: str) -> None:
         job["latest_frame_seq"] = -1
         job["latest_summary"] = None
         job["current_stage"] = None
+        job["pause_requested"] = False
+        job["cancel_requested"] = False
         job["stage_states"] = _initial_stage_states(
             {
                 "run_person_detection": bool(job.get("run_person_detection")),
+                "run_ppe_detection": bool(job.get("run_ppe_detection")),
                 "run_region_extraction": bool(job.get("run_region_extraction")),
                 "run_facemask_detection": bool(job.get("run_facemask_detection")),
                 "run_glove_detection": bool(job.get("run_glove_detection")),
@@ -654,11 +746,14 @@ def run_job_worker(job_id: str) -> None:
                 persons,
                 frame_index,
             ),
+            should_pause=lambda: _job_control_flags(job)["pause_requested"],
+            should_cancel=lambda: _job_control_flags(job)["cancel_requested"],
         )
         summary = pipeline.run()
         with job["lock"]:
-            job["status"] = "completed"
-            job["current_stage"] = "completed"
+            final_status = str(summary.get("status") or "completed")
+            job["status"] = final_status
+            job["current_stage"] = final_status
             job["crop_dir"] = str(summary["paths"]["crops_dir"])
             job["pipeline_output_root"] = str(summary["output_root"])
             job["summary_path"] = str(summary["paths"]["summary_path"])

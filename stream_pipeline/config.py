@@ -9,6 +9,7 @@ from behavior_detection.config import (
 )
 from facemask_detection.config import CONFIG as FACEMASK_CONFIG, FaceMaskConfig
 from glove_detection.config import CONFIG as GLOVE_CONFIG, GloveDetectionConfig
+from ppe_detection.config import CONFIG as PPE_CONFIG, PPEDetectionConfig
 from person_detection.config import CONFIG as PERSON_CONFIG, AppConfig
 from person_region_extraction.config import (
     CONFIG as REGION_CONFIG,
@@ -22,6 +23,7 @@ class StreamPipelineConfig:
     output_root: str = "stream_pipeline/output"
     job_name: Optional[str] = None
     run_person_detection: bool = True
+    run_ppe_detection: bool = False
     run_region_extraction: bool = True
     run_facemask_detection: bool = True
     run_glove_detection: bool = True
@@ -30,6 +32,9 @@ class StreamPipelineConfig:
     summary_flush_interval_frames: int = 15
     person_detection: AppConfig = field(
         default_factory=lambda: replace(PERSON_CONFIG)
+    )
+    ppe_detection: PPEDetectionConfig = field(
+        default_factory=lambda: replace(PPE_CONFIG)
     )
     person_region_extraction: RegionExtractionConfig = field(
         default_factory=lambda: replace(REGION_CONFIG)
@@ -46,4 +51,3 @@ class StreamPipelineConfig:
 
 
 CONFIG = StreamPipelineConfig()
-

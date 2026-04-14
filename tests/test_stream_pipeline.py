@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 import cv2
 import numpy as np
 
+from behavior_detection.pipeline import DetectionMatch, TrackedPersonBehavior
 from facemask_detection.inference import FaceMaskDetection
 from glove_detection.inference import GloveClassification
 from person_detection.config import PersonInstance
@@ -77,6 +78,7 @@ class FakeRegionExtractor:
             hands=hands,
             torso=torso,
             face_bbox=(0, 0, 24, 24),
+            hand_bboxes=[(2, 12, 14, 24)],
         )
 
 
@@ -94,6 +96,28 @@ class FakeBehaviorPipeline:
     def process_frame(self, frame: np.ndarray, frame_index: int):
         annotated = frame.copy()
         annotated[:, :, 1] = 255
+        behaviors = [
+            TrackedPersonBehavior(
+                tracker_id=11,
+                bbox_xyxy=(4, 4, 28, 28),
+                label="id:11 0.93 | PHONE_USE[1] SMOKE[1]",
+                smoking_candidate=True,
+                phone_present=True,
+                phone_in_hand=True,
+                phone_usage=True,
+                events=[],
+                phone_match=DetectionMatch(
+                    bbox_xyxy=(10, 10, 14, 18),
+                    confidence=0.81,
+                    class_name="cell phone",
+                ),
+                smoke_match=DetectionMatch(
+                    bbox_xyxy=(16, 10, 20, 16),
+                    confidence=0.72,
+                    class_name="cigarette",
+                ),
+            )
+        ]
         events = []
         if frame_index == 0:
             events = [
@@ -109,16 +133,39 @@ class FakeBehaviorPipeline:
                     },
                 )()
             ]
-        return annotated, [], events
+        return annotated, behaviors, events
+
+
+class FakePPEDetectionPipeline:
+    def __init__(self, _config) -> None:
+        self.inference_engine = type("Engine", (), {"device": "cpu"})()
+
+    def runtime_backend_label(self) -> str:
+        return "torch-cpu"
+
+    def predict_records(self, _frame: np.ndarray):
+        return [
+            type(
+                "PPEDetectionRecord",
+                (),
+                {
+                    "class_name": "hardhat",
+                    "confidence": 0.88,
+                    "bbox_xyxy": (6, 6, 20, 20),
+                },
+            )()
+        ]
 
 
 class StreamPipelineTests(unittest.TestCase):
     @patch("stream_pipeline.pipeline.log_queue")
     @patch("stream_pipeline.pipeline.enqueue_log_item", return_value=True)
+    @patch("stream_pipeline.pipeline.BehaviorDetectionPipeline", side_effect=FakeBehaviorPipeline)
     @patch("stream_pipeline.pipeline.classify_glove_image")
     @patch("stream_pipeline.pipeline.load_tflite_glove_classifier")
     @patch("stream_pipeline.pipeline.run_facemask_inference")
     @patch("stream_pipeline.pipeline.load_facemask_inference_engine")
+    @patch("stream_pipeline.pipeline.PPEDetectionPipeline", side_effect=FakePPEDetectionPipeline)
     @patch("stream_pipeline.pipeline.PersonRegionExtractor", side_effect=FakeRegionExtractor)
     @patch("stream_pipeline.pipeline.PersonDetectionPipeline", side_effect=FakePersonPipeline)
     @patch("stream_pipeline.pipeline.cv2.VideoCapture")
@@ -127,10 +174,12 @@ class StreamPipelineTests(unittest.TestCase):
         video_capture_mock,
         _person_pipeline_cls,
         _region_extractor_cls,
+        _ppe_pipeline_cls,
         _load_facemask_engine_mock,
         run_facemask_inference_mock,
         load_glove_classifier_mock,
         classify_glove_image_mock,
+        _behavior_pipeline_cls,
         _enqueue_log_item_mock,
         log_queue_mock,
     ) -> None:
@@ -168,13 +217,17 @@ class StreamPipelineTests(unittest.TestCase):
                 source="./vid_test/vid_1.mp4",
                 output_root=temp_dir,
                 job_name="stream_job",
+                run_ppe_detection=True,
+                run_behavior_detection=True,
                 attribute_refresh_interval_frames=1,
                 summary_flush_interval_frames=1,
             )
             config.person_detection.device = "cpu"
-            config.person_detection.model_path = "./weights/yolo11n.onnx"
+            config.person_detection.model_path = "./weights/onnx/yolo11n.onnx"
             config.person_detection.max_frames = 2
             config.person_detection.crop_save_interval = 1
+            config.ppe_detection.device = "cpu"
+            config.ppe_detection.max_frames = 2
             config.person_region_extraction.device = "cpu"
             config.facemask_detection.device = "cpu"
 
@@ -183,17 +236,31 @@ class StreamPipelineTests(unittest.TestCase):
                 stage_callback=lambda stage_name, stage_status, _stage_result: stage_events.append(
                     (stage_name, stage_status)
                 ),
-                frame_callback=lambda frame_index, total_frames, _annotated_frame, persons: frame_events.append(
-                    (frame_index, total_frames, len(persons))
+                frame_callback=lambda frame_index, total_frames, annotated_frame, persons: frame_events.append(
+                    (
+                        frame_index,
+                        total_frames,
+                        len(persons),
+                        int(np.max(annotated_frame)),
+                        annotated_frame[10, 10].tolist(),
+                    )
                 ),
             ).run()
 
             self.assertEqual(summary["status"], "completed")
-            self.assertEqual(frame_events, [(0, 2, 1), (1, 2, 1)])
+            self.assertEqual(frame_events[0][0:4], (0, 2, 1, 255))
+            self.assertEqual(frame_events[1][0:4], (1, 2, 1, 255))
+            self.assertNotEqual(frame_events[0][4], [0, 0, 0])
             self.assertIn(("person_detection", "running"), stage_events)
+            self.assertIn(("ppe_detection", "completed"), stage_events)
             self.assertIn(("glove_detection", "completed"), stage_events)
+            self.assertIn(("behavior_detection", "completed"), stage_events)
             self.assertEqual(
                 summary["stages"]["facemask_detection"]["summary"]["mask_count"],
+                2,
+            )
+            self.assertEqual(
+                summary["stages"]["ppe_detection"]["summary"]["class_counts"]["hardhat"],
                 2,
             )
             self.assertEqual(
