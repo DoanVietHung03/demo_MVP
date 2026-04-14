@@ -123,6 +123,11 @@ def _distance(point_a: Tuple[float, float], point_b: Tuple[float, float]) -> flo
     return float(np.hypot(point_a[0] - point_b[0], point_a[1] - point_b[1]))
 
 
+def _bbox_area(box: Tuple[int, int, int, int]) -> int:
+    x1, y1, x2, y2 = box
+    return max(1, x2 - x1) * max(1, y2 - y1)
+
+
 def _iou(box_a: Tuple[int, int, int, int], box_b: Tuple[int, int, int, int]) -> float:
     ax1, ay1, ax2, ay2 = box_a
     bx1, by1, bx2, by2 = box_b
@@ -263,6 +268,46 @@ def _update_streak(previous_value: int, condition: bool) -> int:
     if condition:
         return previous_value + 1
     return 0
+
+
+def _should_keep_smoke_match(
+    smoke_match: DetectionMatch,
+    phone_match: Optional[DetectionMatch],
+    person_box: Tuple[int, int, int, int],
+    mouth_point: Tuple[float, float],
+    wrist_points: Sequence[Tuple[float, float]],
+    config: BehaviorDetectionConfig,
+) -> Tuple[bool, bool, bool, bool]:
+    person_diag = _bbox_diag(person_box)
+    smoke_center = _bbox_center(smoke_match.bbox_xyxy)
+    smoke_near_mouth = (
+        _distance(smoke_center, mouth_point)
+        <= person_diag * config.smoking_mouth_distance_ratio
+    )
+    smoke_near_hand = any(
+        _distance(smoke_center, wrist_point)
+        <= person_diag * config.smoking_hand_distance_ratio
+        for wrist_point in wrist_points
+    )
+    hand_to_mouth = any(
+        _distance(wrist_point, mouth_point)
+        <= person_diag * config.hand_to_mouth_distance_ratio
+        for wrist_point in wrist_points
+    )
+    overlaps_phone = (
+        phone_match is not None
+        and _iou(smoke_match.bbox_xyxy, phone_match.bbox_xyxy)
+        >= config.smoke_phone_overlap_iou_threshold
+    )
+    smoke_area_ratio = _bbox_area(smoke_match.bbox_xyxy) / float(_bbox_area(person_box))
+    smoke_box_is_reasonable = smoke_area_ratio <= config.smoke_max_box_area_ratio
+    smoke_context_is_plausible = smoke_near_mouth or (smoke_near_hand and hand_to_mouth)
+    keep_smoke_match = (
+        smoke_context_is_plausible
+        and smoke_box_is_reasonable
+        and not overlaps_phone
+    )
+    return keep_smoke_match, smoke_near_mouth, smoke_near_hand, hand_to_mouth
 
 
 def _draw_text_chip(
@@ -533,27 +578,31 @@ class BehaviorDetectionPipeline:
                 phone_usage = near_hand or near_face
 
             if person_smoke_matches:
-                best_smoke_match = max(
+                raw_best_smoke_match = max(
                     person_smoke_matches,
                     key=lambda item: item.confidence,
                 )
-                smoking_best_conf = best_smoke_match.confidence
-                smoke_center = _bbox_center(best_smoke_match.bbox_xyxy)
-                smoke_near_mouth = (
-                    _distance(smoke_center, mouth_point)
-                    <= person_diag * self.config.smoking_mouth_distance_ratio
+                (
+                    keep_smoke_match,
+                    smoke_near_mouth,
+                    smoke_near_hand,
+                    hand_to_mouth,
+                ) = _should_keep_smoke_match(
+                    raw_best_smoke_match,
+                    best_phone_match,
+                    person_box,
+                    mouth_point,
+                    wrist_points,
+                    self.config,
                 )
-                smoke_near_hand = any(
-                    _distance(smoke_center, wrist_point)
-                    <= person_diag * self.config.smoking_hand_distance_ratio
-                    for wrist_point in wrist_points
+                if keep_smoke_match:
+                    best_smoke_match = raw_best_smoke_match
+                    smoking_best_conf = best_smoke_match.confidence
+                smoking_candidate = (
+                    keep_smoke_match
+                    and smoke_near_mouth
+                    and (smoke_near_hand or hand_to_mouth)
                 )
-                hand_to_mouth = any(
-                    _distance(wrist_point, mouth_point)
-                    <= person_diag * self.config.hand_to_mouth_distance_ratio
-                    for wrist_point in wrist_points
-                )
-                smoking_candidate = smoke_near_mouth and (smoke_near_hand or hand_to_mouth)
             else:
                 smoke_near_mouth = False
                 smoke_near_hand = False

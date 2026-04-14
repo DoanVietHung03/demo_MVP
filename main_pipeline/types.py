@@ -31,20 +31,24 @@ class StageRunResult:
 class PipelinePaths:
     run_root: Path
     crops_dir: Path
+    ppe_output_root: Path
     region_output_root: Path
     facemask_output_root: Path
     glove_output_root: Path
     behavior_output_root: Path
+    video_output_root: Path
     summary_path: Path
 
     def to_dict(self) -> Dict[str, str]:
         return {
             "run_root": str(self.run_root),
             "crops_dir": str(self.crops_dir),
+            "ppe_output_root": str(self.ppe_output_root),
             "region_output_root": str(self.region_output_root),
             "facemask_output_root": str(self.facemask_output_root),
             "glove_output_root": str(self.glove_output_root),
             "behavior_output_root": str(self.behavior_output_root),
+            "video_output_root": str(self.video_output_root),
             "summary_path": str(self.summary_path),
         }
 

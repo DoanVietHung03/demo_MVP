@@ -7,17 +7,17 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Dict, Optional, Union
 
-from behavior_detection.pipeline import BehaviorDetectionPipeline
-from facemask_detection.pipeline import process_head_face_tree
-from glove_detection.pipeline import process_hands_tree
-from main_pipeline.config import MainPipelineConfig
-from main_pipeline.types import PipelinePaths, PipelineRunSummary, StageRunResult
-from person_detection.config import PersonInstance
-from person_detection.pipeline import PersonDetectionPipeline, log_queue
-from person_region_extraction.pipeline import process_crop_tree
+import cv2
+import numpy as np
 
-StageCallback = Callable[[str, str, Optional[StageRunResult]], None]
-PersonFrameCallback = Callable[[int, Optional[int], object, list[PersonInstance]], None]
+from main_pipeline.config import MainPipelineConfig
+from main_pipeline.types import PipelinePaths
+from person_detection.config import PersonInstance
+from stream_pipeline.config import StreamPipelineConfig
+from stream_pipeline.pipeline import StreamPipeline
+
+StageCallback = Callable[[str, str, Optional[object]], None]
+FrameCallback = Callable[[int, Optional[int], np.ndarray, list[PersonInstance]], None]
 
 
 def sanitize_job_name(value: str) -> str:
@@ -43,12 +43,92 @@ def build_pipeline_paths(
     return PipelinePaths(
         run_root=run_root,
         crops_dir=run_root / "crops",
+        ppe_output_root=run_root / "ppe_detection",
         region_output_root=run_root / "person_region_extraction",
         facemask_output_root=run_root / "facemask_detection",
         glove_output_root=run_root / "glove_detection",
         behavior_output_root=run_root / "behavior_detection",
+        video_output_root=run_root / "videos",
         summary_path=run_root / "summary.json",
     )
+
+
+def _normalize_stage_selection(config: MainPipelineConfig) -> Dict[str, bool]:
+    stage_flags = {
+        "run_person_detection": bool(config.run_person_detection),
+        "run_ppe_detection": bool(config.run_ppe_detection),
+        "run_region_extraction": bool(config.run_region_extraction),
+        "run_facemask_detection": bool(config.run_facemask_detection),
+        "run_glove_detection": bool(config.run_glove_detection),
+        "run_behavior_detection": bool(config.run_behavior_detection),
+    }
+
+    if stage_flags["run_facemask_detection"] or stage_flags["run_glove_detection"]:
+        stage_flags["run_region_extraction"] = True
+    if stage_flags["run_region_extraction"]:
+        stage_flags["run_person_detection"] = True
+
+    if not any(stage_flags.values()):
+        raise ValueError("At least one offline stage must be enabled.")
+
+    return stage_flags
+
+
+class OfflineVideoRecorder:
+    def __init__(
+        self,
+        source: Union[str, int],
+        output_path: Path,
+        codec: str,
+        fps: Optional[float] = None,
+    ) -> None:
+        self.source = source
+        self.output_path = output_path
+        self.codec = (codec or "mp4v")[:4]
+        self.requested_fps = fps
+        self.writer: Optional[cv2.VideoWriter] = None
+        self.resolved_fps: Optional[float] = None
+        self.frame_count = 0
+
+    def _probe_source_fps(self) -> float:
+        cap = cv2.VideoCapture(self.source)
+        try:
+            fps = float(cap.get(cv2.CAP_PROP_FPS)) if cap.isOpened() else 0.0
+        finally:
+            cap.release()
+        if fps <= 1.0:
+            return 25.0
+        return fps
+
+    def _ensure_writer(self, frame: np.ndarray) -> None:
+        if self.writer is not None:
+            return
+
+        frame_height, frame_width = frame.shape[:2]
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        fps = float(self.requested_fps) if self.requested_fps else self._probe_source_fps()
+        fourcc = cv2.VideoWriter_fourcc(*self.codec)
+        writer = cv2.VideoWriter(
+            str(self.output_path),
+            fourcc,
+            fps,
+            (frame_width, frame_height),
+        )
+        if not writer.isOpened():
+            raise RuntimeError(f"Cannot open video writer: {self.output_path}")
+        self.writer = writer
+        self.resolved_fps = fps
+
+    def write_frame(self, frame: np.ndarray) -> None:
+        self._ensure_writer(frame)
+        assert self.writer is not None
+        self.writer.write(frame)
+        self.frame_count += 1
+
+    def close(self) -> None:
+        if self.writer is not None:
+            self.writer.release()
+            self.writer = None
 
 
 class MainPipeline:
@@ -56,354 +136,103 @@ class MainPipeline:
         self,
         config: MainPipelineConfig,
         stage_callback: Optional[StageCallback] = None,
-        person_detection_frame_callback: Optional[PersonFrameCallback] = None,
+        person_detection_frame_callback: Optional[FrameCallback] = None,
     ) -> None:
         self.config = config
         self.stage_callback = stage_callback
-        self.person_detection_frame_callback = person_detection_frame_callback
+        self.frame_callback = person_detection_frame_callback
 
-    def _notify_stage(
-        self,
-        stage_name: str,
-        status: str,
-        stage_result: Optional[StageRunResult] = None,
-    ) -> None:
-        if self.stage_callback is not None:
-            self.stage_callback(stage_name, status, stage_result)
-
-    def _write_summary(
-        self,
-        summary: PipelineRunSummary,
-    ) -> None:
-        summary.paths.run_root.mkdir(parents=True, exist_ok=True)
-        summary.paths.summary_path.write_text(
-            json.dumps(summary.to_dict(), indent=2),
-            encoding="utf-8",
+    def _build_stream_config(self) -> tuple[StreamPipelineConfig, Dict[str, bool]]:
+        stage_flags = _normalize_stage_selection(self.config)
+        stream_config = StreamPipelineConfig(
+            source=self.config.source,
+            output_root=self.config.output_root,
+            job_name=self.config.job_name,
+            run_person_detection=stage_flags["run_person_detection"],
+            run_ppe_detection=stage_flags["run_ppe_detection"],
+            run_region_extraction=stage_flags["run_region_extraction"],
+            run_facemask_detection=stage_flags["run_facemask_detection"],
+            run_glove_detection=stage_flags["run_glove_detection"],
+            run_behavior_detection=stage_flags["run_behavior_detection"],
+            attribute_refresh_interval_frames=int(
+                self.config.attribute_refresh_interval_frames
+            ),
+            summary_flush_interval_frames=int(self.config.summary_flush_interval_frames),
+            person_detection=replace(self.config.person_detection),
+            ppe_detection=replace(self.config.ppe_detection),
+            person_region_extraction=replace(self.config.person_region_extraction),
+            facemask_detection=replace(self.config.facemask_detection),
+            glove_detection=replace(self.config.glove_detection),
+            behavior_detection=replace(self.config.behavior_detection),
         )
-
-    def _run_person_detection_stage(
-        self,
-        paths: PipelinePaths,
-    ) -> StageRunResult:
-        config = replace(self.config.person_detection)
-        config.source = self.config.source
-
-        pipeline = PersonDetectionPipeline(
-            model_path=config.model_path,
-            device=config.device,
-            confidence_threshold=config.confidence_threshold,
-            iou_threshold=config.iou_threshold,
-            crop_padding=config.crop_padding,
-            input_resize_scale=config.input_resize_scale,
-            track_ttl_frames=config.track_ttl_frames,
-            alert_cooldown_frames=config.alert_cooldown_frames,
-        )
-        pipeline.process_video(
-            source=config.source,
-            output_dir=paths.crops_dir,
-            frame_skip=config.frame_skip,
-            crop_save_interval=config.crop_save_interval,
-            max_frames=config.max_frames,
-            frame_callback=self.person_detection_frame_callback,
-        )
-        log_queue.join()
-
-        track_dirs = [
-            path for path in paths.crops_dir.glob("track_*") if path.is_dir()
-        ]
-        crop_files = [
-            path for path in paths.crops_dir.glob("track_*/*.jpg") if path.is_file()
-        ]
-        summary: Dict[str, object] = {
-            "source": str(config.source),
-            "output_dir": str(paths.crops_dir),
-            "runtime_backend": str(pipeline.runtime_backend_label()),
-            "model_path": config.model_path,
-            "track_dir_count": len(track_dirs),
-            "crop_file_count": len(crop_files),
-        }
-        return StageRunResult(
-            name="person_detection",
-            enabled=True,
-            input_path=str(config.source),
-            output_path=str(paths.crops_dir),
-            summary=summary,
-        )
-
-    def _run_region_extraction_stage(
-        self,
-        paths: PipelinePaths,
-        person_result: Optional[StageRunResult],
-    ) -> StageRunResult:
-        config = replace(self.config.person_region_extraction)
-        config.output_root = str(paths.region_output_root)
-        if person_result is not None and person_result.output_path:
-            config.input_crops_dir = person_result.output_path
-            config.process_latest_job = False
-
-        summary = process_crop_tree(config)
-        return StageRunResult(
-            name="person_region_extraction",
-            enabled=True,
-            input_path=str(summary["input_crops_dir"]),
-            output_path=str(summary["output_root"]),
-            summary=summary,
-        )
-
-    def _run_facemask_stage(
-        self,
-        paths: PipelinePaths,
-        region_result: Optional[StageRunResult],
-    ) -> StageRunResult:
-        config = replace(self.config.facemask_detection)
-        config.output_root = str(paths.facemask_output_root)
-        if region_result is not None and region_result.output_path:
-            config.input_head_face_dir = region_result.output_path
-            config.process_latest_job = False
-
-        summary = process_head_face_tree(config)
-        return StageRunResult(
-            name="facemask_detection",
-            enabled=True,
-            input_path=str(summary["input_root"]),
-            output_path=str(summary["output_root"]),
-            summary=summary,
-        )
-
-    def _run_glove_stage(
-        self,
-        paths: PipelinePaths,
-        region_result: Optional[StageRunResult],
-    ) -> StageRunResult:
-        config = replace(self.config.glove_detection)
-        config.output_root = str(paths.glove_output_root)
-        if region_result is not None and region_result.output_path:
-            config.input_hands_dir = region_result.output_path
-            config.process_latest_job = False
-
-        summary = process_hands_tree(config)
-        return StageRunResult(
-            name="glove_detection",
-            enabled=True,
-            input_path=str(summary["input_root"]),
-            output_path=str(summary["output_root"]),
-            summary=summary,
-        )
-
-    def _run_behavior_stage(
-        self,
-        paths: PipelinePaths,
-    ) -> StageRunResult:
-        config = replace(self.config.behavior_detection)
-        config.source = self.config.source
-        config.output_root = str(paths.behavior_output_root)
-
-        summary = BehaviorDetectionPipeline(config).process_video(
-            source=config.source,
-            output_root=config.output_root,
-        )
-        return StageRunResult(
-            name="behavior_detection",
-            enabled=True,
-            input_path=str(config.source),
-            output_path=str(summary["output_root"]),
-            summary=summary,
-        )
+        return stream_config, stage_flags
 
     def run(self) -> Dict[str, object]:
-        job_name = build_job_name(self.config.source, self.config.job_name)
-        paths = build_pipeline_paths(self.config.output_root, job_name)
-        paths.run_root.mkdir(parents=True, exist_ok=True)
+        if not str(self.config.source).strip():
+            raise ValueError("Offline pipeline source must not be empty.")
 
-        summary = PipelineRunSummary(
-            job_name=job_name,
-            source=str(self.config.source),
-            output_root=str(paths.run_root),
-            status="running",
-            paths=paths,
-        )
-        self._write_summary(summary)
+        stream_config, stage_flags = self._build_stream_config()
+        job_name = build_job_name(stream_config.source, stream_config.job_name)
+        paths = build_pipeline_paths(stream_config.output_root, job_name)
 
+        video_recorder: Optional[OfflineVideoRecorder] = None
+        if self.config.save_annotated_video:
+            annotated_video_path = (
+                paths.video_output_root / self.config.annotated_video_filename
+            )
+            video_recorder = OfflineVideoRecorder(
+                source=stream_config.source,
+                output_path=annotated_video_path,
+                codec=self.config.annotated_video_codec,
+                fps=self.config.annotated_video_fps,
+            )
+
+        def combined_frame_callback(
+            frame_index: int,
+            total_frames: Optional[int],
+            annotated_frame: np.ndarray,
+            persons: list[PersonInstance],
+        ) -> None:
+            if video_recorder is not None:
+                video_recorder.write_frame(annotated_frame)
+            if self.frame_callback is not None:
+                self.frame_callback(frame_index, total_frames, annotated_frame, persons)
+
+        summary: Optional[Dict[str, object]] = None
         try:
-            person_result: Optional[StageRunResult] = None
-            region_result: Optional[StageRunResult] = None
+            summary = StreamPipeline(
+                stream_config,
+                stage_callback=self.stage_callback,
+                frame_callback=combined_frame_callback,
+            ).run()
+        finally:
+            if video_recorder is not None:
+                video_recorder.close()
 
-            if self.config.run_person_detection:
-                self._notify_stage("person_detection", "running")
-                try:
-                    person_result = self._run_person_detection_stage(paths)
-                except Exception as exc:
-                    failed_result = StageRunResult(
-                        name="person_detection",
-                        enabled=True,
-                        success=False,
-                        input_path=str(self.config.source),
-                        output_path=str(paths.crops_dir),
-                        error=str(exc),
-                    )
-                    summary.stages["person_detection"] = failed_result
-                    self._notify_stage("person_detection", "failed", failed_result)
-                    raise
-                summary.stages[person_result.name] = person_result
-                self._notify_stage("person_detection", "completed", person_result)
-                self._write_summary(summary)
-            else:
-                summary.stages["person_detection"] = StageRunResult(
-                    name="person_detection",
-                    enabled=False,
-                )
-                self._notify_stage(
-                    "person_detection",
-                    "disabled",
-                    summary.stages["person_detection"],
-                )
+        paths_payload = dict(summary.get("paths", {}))
+        paths_payload["video_output_root"] = str(paths.video_output_root)
+        summary["paths"] = paths_payload
+        summary["pipeline_mode"] = "offline"
+        summary["requested_stage_flags"] = {
+            "run_person_detection": bool(self.config.run_person_detection),
+            "run_ppe_detection": bool(self.config.run_ppe_detection),
+            "run_region_extraction": bool(self.config.run_region_extraction),
+            "run_facemask_detection": bool(self.config.run_facemask_detection),
+            "run_glove_detection": bool(self.config.run_glove_detection),
+            "run_behavior_detection": bool(self.config.run_behavior_detection),
+        }
+        summary["effective_stage_flags"] = dict(stage_flags)
 
-            if self.config.run_region_extraction:
-                self._notify_stage("person_region_extraction", "running")
-                try:
-                    region_result = self._run_region_extraction_stage(paths, person_result)
-                except Exception as exc:
-                    failed_result = StageRunResult(
-                        name="person_region_extraction",
-                        enabled=True,
-                        success=False,
-                        input_path=person_result.output_path if person_result else None,
-                        output_path=str(paths.region_output_root),
-                        error=str(exc),
-                    )
-                    summary.stages["person_region_extraction"] = failed_result
-                    self._notify_stage(
-                        "person_region_extraction",
-                        "failed",
-                        failed_result,
-                    )
-                    raise
-                summary.stages[region_result.name] = region_result
-                self._notify_stage(
-                    "person_region_extraction",
-                    "completed",
-                    region_result,
-                )
-                self._write_summary(summary)
-            else:
-                summary.stages["person_region_extraction"] = StageRunResult(
-                    name="person_region_extraction",
-                    enabled=False,
-                )
-                self._notify_stage(
-                    "person_region_extraction",
-                    "disabled",
-                    summary.stages["person_region_extraction"],
-                )
+        if video_recorder is not None and video_recorder.frame_count > 0:
+            summary["annotated_video"] = {
+                "path": str(paths.video_output_root / self.config.annotated_video_filename),
+                "frame_count": int(video_recorder.frame_count),
+                "fps": float(video_recorder.resolved_fps or 25.0),
+                "codec": self.config.annotated_video_codec,
+            }
+        else:
+            summary["annotated_video"] = None
 
-            if self.config.run_facemask_detection:
-                self._notify_stage("facemask_detection", "running")
-                try:
-                    facemask_result = self._run_facemask_stage(paths, region_result)
-                except Exception as exc:
-                    failed_result = StageRunResult(
-                        name="facemask_detection",
-                        enabled=True,
-                        success=False,
-                        input_path=region_result.output_path if region_result else None,
-                        output_path=str(paths.facemask_output_root),
-                        error=str(exc),
-                    )
-                    summary.stages["facemask_detection"] = failed_result
-                    self._notify_stage(
-                        "facemask_detection",
-                        "failed",
-                        failed_result,
-                    )
-                    raise
-                summary.stages[facemask_result.name] = facemask_result
-                self._notify_stage(
-                    "facemask_detection",
-                    "completed",
-                    facemask_result,
-                )
-                self._write_summary(summary)
-            else:
-                summary.stages["facemask_detection"] = StageRunResult(
-                    name="facemask_detection",
-                    enabled=False,
-                )
-                self._notify_stage(
-                    "facemask_detection",
-                    "disabled",
-                    summary.stages["facemask_detection"],
-                )
-
-            if self.config.run_glove_detection:
-                self._notify_stage("glove_detection", "running")
-                try:
-                    glove_result = self._run_glove_stage(paths, region_result)
-                except Exception as exc:
-                    failed_result = StageRunResult(
-                        name="glove_detection",
-                        enabled=True,
-                        success=False,
-                        input_path=region_result.output_path if region_result else None,
-                        output_path=str(paths.glove_output_root),
-                        error=str(exc),
-                    )
-                    summary.stages["glove_detection"] = failed_result
-                    self._notify_stage("glove_detection", "failed", failed_result)
-                    raise
-                summary.stages[glove_result.name] = glove_result
-                self._notify_stage("glove_detection", "completed", glove_result)
-                self._write_summary(summary)
-            else:
-                summary.stages["glove_detection"] = StageRunResult(
-                    name="glove_detection",
-                    enabled=False,
-                )
-                self._notify_stage(
-                    "glove_detection",
-                    "disabled",
-                    summary.stages["glove_detection"],
-                )
-
-            if self.config.run_behavior_detection:
-                self._notify_stage("behavior_detection", "running")
-                try:
-                    behavior_result = self._run_behavior_stage(paths)
-                except Exception as exc:
-                    failed_result = StageRunResult(
-                        name="behavior_detection",
-                        enabled=True,
-                        success=False,
-                        input_path=str(self.config.source),
-                        output_path=str(paths.behavior_output_root),
-                        error=str(exc),
-                    )
-                    summary.stages["behavior_detection"] = failed_result
-                    self._notify_stage("behavior_detection", "failed", failed_result)
-                    raise
-                summary.stages[behavior_result.name] = behavior_result
-                self._notify_stage(
-                    "behavior_detection",
-                    "completed",
-                    behavior_result,
-                )
-                self._write_summary(summary)
-            else:
-                summary.stages["behavior_detection"] = StageRunResult(
-                    name="behavior_detection",
-                    enabled=False,
-                )
-                self._notify_stage(
-                    "behavior_detection",
-                    "disabled",
-                    summary.stages["behavior_detection"],
-                )
-
-            summary.status = "completed"
-        except Exception as exc:
-            summary.status = "failed"
-            summary.error = str(exc)
-            self._write_summary(summary)
-            raise
-
-        self._write_summary(summary)
-        return summary.to_dict()
+        summary_path = Path(str(summary["paths"]["summary_path"]))
+        summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        return summary

@@ -1,19 +1,27 @@
 from __future__ import annotations
 
+import json
 import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
+import cv2
 import numpy as np
 
 from glove_detection.config import GloveDetectionConfig
 from glove_detection.inference import (
+    GloveClassification,
     _prepare_quantized_input,
     load_labels,
     normalize_glove_label,
 )
-from glove_detection.pipeline import resolve_final_label, resolve_input_hands_dir
+from glove_detection.pipeline import (
+    process_hands_tree,
+    resolve_final_label,
+    resolve_input_hands_dir,
+)
 
 
 class GloveDetectionInferenceTests(unittest.TestCase):
@@ -111,3 +119,64 @@ class ResolveInputHandsDirTests(unittest.TestCase):
                 "input_hands_dir must be set when process_latest_job is False",
             ):
                 resolve_input_hands_dir(config)
+
+
+class GloveBatchPipelineTests(unittest.TestCase):
+    @patch("glove_detection.pipeline.load_tflite_glove_classifier", return_value=object())
+    @patch("glove_detection.pipeline.classify_glove_image")
+    def test_process_hands_tree_uses_per_hand_metadata_when_available(
+        self,
+        classify_glove_image_mock,
+        _load_classifier_mock,
+    ) -> None:
+        classify_glove_image_mock.side_effect = [
+            GloveClassification(
+                class_index=0,
+                raw_label="glove",
+                normalized_label="Glove",
+                confidence=0.81,
+            ),
+            GloveClassification(
+                class_index=1,
+                raw_label="hand",
+                normalized_label="NoGlove",
+                confidence=0.76,
+            ),
+        ]
+
+        with TemporaryDirectory() as temp_dir:
+            input_root = Path(temp_dir) / "job_demo"
+            frame_dir = input_root / "track_1" / "frame_000001"
+            frame_dir.mkdir(parents=True)
+
+            hands_image = np.zeros((24, 48, 3), dtype=np.uint8)
+            hands_image[:, :20] = (0, 255, 0)
+            hands_image[:, 28:] = (0, 0, 255)
+            cv2.imwrite(str(frame_dir / "hands.jpg"), hands_image)
+            (frame_dir / "regions.json").write_text(
+                '{"hand_crop_boxes": [[0, 0, 20, 24], [28, 0, 48, 24]]}',
+                encoding="utf-8",
+            )
+
+            config = GloveDetectionConfig(
+                input_hands_dir=str(input_root),
+                output_root=str(Path(temp_dir) / "out"),
+                process_latest_job=False,
+            )
+            summary = process_hands_tree(config)
+
+            self.assertEqual(classify_glove_image_mock.call_count, 2)
+            self.assertEqual(summary["processed_count"], 2)
+            self.assertEqual(summary["processed_image_count"], 1)
+            self.assertEqual(summary["glove_count"], 1)
+            self.assertEqual(summary["no_glove_count"], 1)
+
+            prediction_path = (
+                Path(summary["output_root"])
+                / "track_1"
+                / "frame_000001"
+                / "prediction.json"
+            )
+            payload = json.loads(prediction_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["final_label"], "Glove")
+            self.assertEqual(len(payload["hands"]), 2)

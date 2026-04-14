@@ -14,10 +14,10 @@ class BehaviorDetectionConfig:
     output_root: str = "behavior_detection/output/default_run"
     person_confidence_threshold: float = 0.35
     phone_confidence_threshold: float = 0.25
-    smoke_confidence_threshold: float = 0.2
+    smoke_confidence_threshold: float = 0.35
     pose_confidence_threshold: float = 0.25
     iou_threshold: float = 0.45
-    input_resize_scale: float = 0.75
+    input_resize_scale: float = 1.0
     crop_padding: int = 8
     frame_skip: int = 0
     snapshot_interval_frames: int = 10
@@ -32,6 +32,8 @@ class BehaviorDetectionConfig:
     hand_to_mouth_distance_ratio: float = 0.22
     phone_hand_distance_ratio: float = 0.26
     phone_face_distance_ratio: float = 0.24
+    smoke_phone_overlap_iou_threshold: float = 0.1
+    smoke_max_box_area_ratio: float = 0.015
     max_frames: Optional[int] = None
 
 

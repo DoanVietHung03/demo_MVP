@@ -200,6 +200,30 @@ def _resize_frame_for_inference(
     return resized_frame, resize_scale
 
 
+def _attach_detection_class_names(
+    inference_engine: YOLODetectionInference,
+    detections: sv.Detections,
+) -> sv.Detections:
+    if len(detections) == 0 or detections.class_id is None:
+        return detections
+
+    class_id_to_name = {
+        class_id: class_name
+        for class_name, class_id in inference_engine.class_name_to_id.items()
+    }
+    class_names = np.asarray(
+        [
+            class_id_to_name.get(int(class_id), str(int(class_id)))
+            for class_id in detections.class_id
+        ],
+        dtype=object,
+    )
+    data = dict(getattr(detections, "data", {}) or {})
+    data["class_name"] = class_names
+    detections.data = data
+    return detections
+
+
 def infer_filtered_detections(
     inference_engine: YOLODetectionInference,
     frame: np.ndarray,
@@ -228,11 +252,12 @@ def infer_detections(
             confidence_threshold=float(inference_engine.confidence_threshold),
             iou_threshold=float(inference_engine.iou_threshold),
         )
-        return sv.Detections(
+        detections = sv.Detections(
             xyxy=xyxy,
             confidence=confidence,
             class_id=class_id,
         )
+        return _attach_detection_class_names(inference_engine, detections)
 
     inference_frame, resize_scale = _resize_frame_for_inference(
         frame,
@@ -251,7 +276,7 @@ def infer_detections(
 
     if resize_scale != 1.0:
         detections.xyxy = detections.xyxy / resize_scale
-    return detections
+    return _attach_detection_class_names(inference_engine, detections)
 
 
 def filter_detections_by_class_names(

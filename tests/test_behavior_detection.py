@@ -8,11 +8,12 @@ import numpy as np
 import supervision as sv
 
 from behavior_detection.config import BehaviorDetectionConfig
-from behavior_detection.inference import filter_detections_by_class_names
+from behavior_detection.inference import filter_detections_by_class_names, infer_detections
 from behavior_detection.pipeline import (
     BehaviorDetectionPipeline,
     DetectionMatch,
     TrackedPersonBehavior,
+    _should_keep_smoke_match,
     annotate_behavior_evidence,
 )
 
@@ -133,3 +134,59 @@ class BehaviorDetectionInferenceTests(unittest.TestCase):
         self.assertGreater(int(annotated.max()), 0)
         self.assertFalse(np.array_equal(annotated[10, 10], frame[10, 10]))
         self.assertFalse(np.array_equal(annotated[12, 20], frame[12, 20]))
+
+    def test_should_keep_smoke_match_rejects_overlap_with_phone(self) -> None:
+        config = BehaviorDetectionConfig(
+            device="cpu",
+            smoke_phone_overlap_iou_threshold=0.1,
+            smoke_max_box_area_ratio=0.05,
+        )
+        smoke_match = DetectionMatch(
+            bbox_xyxy=(40, 30, 54, 42),
+            confidence=0.71,
+            class_name="cigarette",
+        )
+        phone_match = DetectionMatch(
+            bbox_xyxy=(38, 28, 56, 44),
+            confidence=0.83,
+            class_name="cell phone",
+        )
+
+        keep_smoke_match, smoke_near_mouth, smoke_near_hand, hand_to_mouth = (
+            _should_keep_smoke_match(
+                smoke_match,
+                phone_match,
+                person_box=(0, 0, 100, 200),
+                mouth_point=(46.0, -10.0),
+                wrist_points=[(46.0, 70.0)],
+                config=config,
+            )
+        )
+
+        self.assertFalse(keep_smoke_match)
+        self.assertTrue(smoke_near_hand)
+        self.assertFalse(hand_to_mouth)
+        self.assertFalse(smoke_near_mouth)
+
+    @patch("behavior_detection.inference.run_yolo_onnx_detections")
+    def test_infer_detections_attaches_class_name_metadata_for_onnx(
+        self,
+        run_yolo_onnx_detections_mock,
+    ) -> None:
+        run_yolo_onnx_detections_mock.return_value = (
+            np.asarray([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=np.float32),
+            np.asarray([0.9, 0.8], dtype=np.float32),
+            np.asarray([0, 1], dtype=np.int32),
+        )
+        engine = SimpleNamespace(
+            backend="onnx",
+            onnx_session=object(),
+            input_resize_scale=1.0,
+            confidence_threshold=0.25,
+            iou_threshold=0.45,
+            class_name_to_id={"cigarette": 0, "vape": 1},
+        )
+
+        detections = infer_detections(engine, np.zeros((16, 16, 3), dtype=np.uint8))
+
+        self.assertEqual(detections.data["class_name"].tolist(), ["cigarette", "vape"])

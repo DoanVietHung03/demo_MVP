@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -36,6 +37,7 @@ class RegionResult:
     torso: np.ndarray
     face_bbox: Optional[Tuple[int, int, int, int]]
     hand_bboxes: List[Tuple[int, int, int, int]] = field(default_factory=list)
+    hand_crop_boxes: List[Tuple[int, int, int, int]] = field(default_factory=list)
 
 
 @dataclass
@@ -100,13 +102,16 @@ def _ensure_min_image_size(
     )
 
 
-def _concat_hand_regions(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+def _concat_hand_regions(
+    left: np.ndarray,
+    right: np.ndarray,
+) -> Tuple[np.ndarray, List[Tuple[int, int, int, int]]]:
     if left.size == 0 and right.size == 0:
-        return np.empty((0, 0, 3), dtype=np.uint8)
+        return np.empty((0, 0, 3), dtype=np.uint8), []
     if left.size == 0:
-        return right
+        return right, [(0, 0, right.shape[1], right.shape[0])]
     if right.size == 0:
-        return left
+        return left, [(0, 0, left.shape[1], left.shape[0])]
 
     target_height = max(left.shape[0], right.shape[0])
 
@@ -119,7 +124,15 @@ def _concat_hand_regions(left: np.ndarray, right: np.ndarray) -> np.ndarray:
     left_resized = resize_to_height(left, target_height)
     right_resized = resize_to_height(right, target_height)
     spacer = np.zeros((target_height, 8, 3), dtype=left.dtype)
-    return cv2.hconcat([left_resized, spacer, right_resized])
+    left_box = (0, 0, left_resized.shape[1], left_resized.shape[0])
+    right_offset_x = left_resized.shape[1] + spacer.shape[1]
+    right_box = (
+        right_offset_x,
+        0,
+        right_offset_x + right_resized.shape[1],
+        right_resized.shape[0],
+    )
+    return cv2.hconcat([left_resized, spacer, right_resized]), [left_box, right_box]
 
 
 def _xyxy_from_points(
@@ -442,7 +455,11 @@ class PersonRegionExtractor:
         self,
         image: np.ndarray,
         pose: Optional[PoseEstimate],
-    ) -> Tuple[np.ndarray, List[Tuple[int, int, int, int]]]:
+    ) -> Tuple[
+        np.ndarray,
+        List[Tuple[int, int, int, int]],
+        List[Tuple[int, int, int, int]],
+    ]:
         if pose is not None:
             left_box = self._estimate_hand_box(image, pose, LEFT_WRIST, LEFT_ELBOW)
             right_box = self._estimate_hand_box(image, pose, RIGHT_WRIST, RIGHT_ELBOW)
@@ -462,7 +479,8 @@ class PersonRegionExtractor:
                     for hand_box in (left_box, right_box)
                     if hand_box is not None
                 ]
-                return _concat_hand_regions(left_crop, right_crop), hand_bboxes
+                hand_image, hand_crop_boxes = _concat_hand_regions(left_crop, right_crop)
+                return hand_image, hand_bboxes, hand_crop_boxes
 
         height, width = image.shape[:2]
         y1 = int(height * self.config.hands_top_ratio)
@@ -470,10 +488,11 @@ class PersonRegionExtractor:
         side_width = max(1, int(width * self.config.hand_side_width_ratio))
         left_box = _clip_box(0, y1, side_width, y2, width, height)
         right_box = _clip_box(width - side_width, y1, width, y2, width, height)
-        return _concat_hand_regions(
+        hand_image, hand_crop_boxes = _concat_hand_regions(
             _crop(image, left_box),
             _crop(image, right_box),
-        ), [left_box, right_box]
+        )
+        return hand_image, [left_box, right_box], hand_crop_boxes
 
     def _ensure_min_face_crop_size(self, head_face_crop: np.ndarray) -> np.ndarray:
         return _ensure_min_image_size(
@@ -485,7 +504,7 @@ class PersonRegionExtractor:
         pose = self._predict_pose(image)
         head_face_bbox = self._estimate_head_face_bbox(image, pose)
         torso_bbox = self._estimate_torso_bbox(image, pose, head_face_bbox)
-        hands_crop, hand_bboxes = self._estimate_hands_regions(image, pose)
+        hands_crop, hand_bboxes, hand_crop_boxes = self._estimate_hands_regions(image, pose)
         head_face_crop = self._ensure_min_face_crop_size(
             _crop(image, head_face_bbox)
         )
@@ -495,6 +514,7 @@ class PersonRegionExtractor:
             torso=_crop(image, torso_bbox),
             face_bbox=head_face_bbox,
             hand_bboxes=hand_bboxes,
+            hand_crop_boxes=hand_crop_boxes,
         )
 
 
@@ -560,6 +580,21 @@ def process_crop_tree(config: RegionExtractionConfig) -> Dict[str, object]:
         cv2.imwrite(str(frame_output_dir / "head_face.jpg"), regions.head_face)
         cv2.imwrite(str(frame_output_dir / "hands.jpg"), regions.hands)
         cv2.imwrite(str(frame_output_dir / "torso.jpg"), regions.torso)
+        (frame_output_dir / "regions.json").write_text(
+            json.dumps(
+                {
+                    "face_bbox": list(regions.face_bbox) if regions.face_bbox else None,
+                    "hand_bboxes": [list(box) for box in regions.hand_bboxes],
+                    "hand_crop_boxes": [list(box) for box in regions.hand_crop_boxes],
+                    "head_face_shape": list(regions.head_face.shape),
+                    "hands_shape": list(regions.hands.shape),
+                    "torso_shape": list(regions.torso.shape),
+                    "source_crop_shape": list(image.shape),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
         processed_count += 1
 
     return {

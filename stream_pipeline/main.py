@@ -1,11 +1,26 @@
 from __future__ import annotations
 
-try:
-    from stream_pipeline.config import CONFIG
-    from stream_pipeline.pipeline import StreamPipeline
-except ModuleNotFoundError:  # pragma: no cover - convenience for direct script execution
-    from config import CONFIG
-    from pipeline import StreamPipeline
+import sys
+
+
+if __package__ in (None, ""):  # pragma: no cover - direct script execution helper
+    package_dir = sys.path[0] or "."
+    normalized_package_dir = package_dir.rstrip("/\\")
+    separator_index = max(
+        normalized_package_dir.rfind("/"),
+        normalized_package_dir.rfind("\\"),
+    )
+    repo_root = (
+        normalized_package_dir[:separator_index]
+        if separator_index >= 0
+        else "."
+    )
+    if package_dir in sys.path:
+        sys.path.remove(package_dir)
+    sys.path.insert(0, repo_root or ".")
+
+from stream_pipeline.config import CONFIG
+from stream_pipeline.pipeline import StreamPipeline
 
 
 def main() -> None:
